@@ -1,0 +1,11 @@
+.DS_Store
+*.log
+*.pid
+
+# Local llama.cpp build artifacts are intentionally kept out of git.
+builds/
+
+# Runtime logs and cache/state
+logs/
+.cache/
+slot-kv/
