@@ -8,6 +8,25 @@ set -euo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 cd "$SCRIPT_DIR"
 
+BACKGROUND="${BACKGROUND:-0}"
+for arg in "$@"; do
+  case "$arg" in
+    --background) BACKGROUND=1 ;;
+    --foreground) BACKGROUND=0 ;;
+    -h|--help)
+      cat <<'EOF'
+Usage: ./run-lmcache-proxy-stack.sh [--background|--foreground]
+
+Starts supervised llama.cpp backend + LMCache proxy stack.
+Foreground is the default. --background starts a detached supervisor and exits.
+Configure ports/cache/model with environment variables documented in README.md.
+EOF
+      exit 0
+      ;;
+    *) echo "Unknown argument: $arg" >&2; exit 2 ;;
+  esac
+done
+
 PUBLIC_HOST="${PUBLIC_HOST:-127.0.0.1}"
 PUBLIC_PORT="${PUBLIC_PORT:-8081}"
 BACKEND_HOST="${BACKEND_HOST:-127.0.0.1}"
@@ -46,8 +65,20 @@ STAMP="${STAMP:-$(date +%Y%m%d-%H%M%S)}"
 BACKEND_LOG="${BACKEND_LOG:-$LOG_DIR/qwen36-backend-${STAMP}.log}"
 PROXY_LOG="${PROXY_LOG:-$LOG_DIR/lmcache-proxy-${STAMP}.log}"
 STACK_PID_FILE="${STACK_PID_FILE:-/tmp/lmcache-proxy-stack.pid}"
+STACK_LOG="${STACK_LOG:-$LOG_DIR/stack-${STAMP}.log}"
 PROXY_PID_FILE="${PROXY_PID_FILE:-/tmp/lmcache-proxy.pid}"
 BACKEND_PID_FILE="${BACKEND_PID_FILE:-/tmp/qwen36-llamacpp-backend.pid}"
+
+if [[ "$BACKGROUND" == "1" ]]; then
+  echo "Starting supervised stack in background"
+  echo "Supervisor log: $STACK_LOG"
+  BACKGROUND=0 nohup "$0" --foreground > "$STACK_LOG" 2>&1 &
+  bg_pid=$!
+  echo "$bg_pid" > "$STACK_PID_FILE"
+  echo "Stack supervisor PID: $bg_pid"
+  echo "Stop with: kill \"\$(cat $STACK_PID_FILE)\""
+  exit 0
+fi
 
 backend_pid=""
 proxy_pid=""

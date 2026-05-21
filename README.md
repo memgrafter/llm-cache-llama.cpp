@@ -57,8 +57,16 @@ When the supervisor/proxy stops, it also stops the llama.cpp backend.
 
 This is the clean story for humans: run one script, get one public endpoint, stop one PID, and both proxy plus llama.cpp terminate together.
 
+Foreground, default:
+
 ```bash
 ./run-lmcache-proxy-stack.sh
+```
+
+Background supervisor:
+
+```bash
+./run-lmcache-proxy-stack.sh --background
 ```
 
 Useful environment overrides:
@@ -106,6 +114,7 @@ PID files:
 Logs are written under `logs/` by default:
 
 ```text
+logs/stack-*.log                # when started with --background, or if redirected manually
 logs/qwen36-backend-*.log
 logs/lmcache-proxy-*.log
 ```
