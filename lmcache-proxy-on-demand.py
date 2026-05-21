@@ -287,8 +287,12 @@ class LMCacheHandler(BaseHTTPRequestHandler):
         self._handle_request("DELETE")
 
     def _send_error(self, code: int, message: str = ""):
+        body = message.encode("utf-8")
         self.send_response(code)
-        self._write_body(message)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self._write_body(body)
 
     def _write_response(self, resp):
         """Write response status, headers, and body from urllib's response."""
@@ -300,8 +304,10 @@ class LMCacheHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(resp.read())
 
-    def _write_body(self, body: bytes):
+    def _write_body(self, body: bytes | str):
         """Write response body."""
+        if isinstance(body, str):
+            body = body.encode("utf-8")
         self.wfile.write(body)
 
 
