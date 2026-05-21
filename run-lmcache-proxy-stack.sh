@@ -14,6 +14,12 @@ BACKEND_HOST="${BACKEND_HOST:-127.0.0.1}"
 BACKEND_PORT="${BACKEND_PORT:-8082}"
 CACHE_DIR="${CACHE_DIR:-$HOME/.cache/llama.cpp-launch-scripts/slot-kv}"
 TOP_K="${TOP_K:-3}"
+MIN_SAVE_TOKENS="${MIN_SAVE_TOKENS:-256}"
+PREFIX_CACHE_MAX_BYTES="${PREFIX_CACHE_MAX_BYTES:-2GiB}"
+PREFIX_CACHE_MIN_FREE_BYTES="${PREFIX_CACHE_MIN_FREE_BYTES:-512MiB}"
+NO_AUTO_SAVE="${NO_AUTO_SAVE:-0}"
+NO_PREFIX_CACHE="${NO_PREFIX_CACHE:-0}"
+ALLOW_EXACT_PREFIX_RESTORE="${ALLOW_EXACT_PREFIX_RESTORE:-0}"
 RESTORE_SLOT_ON_START="${RESTORE_SLOT_ON_START:-slot_0_current.bin}"
 RESTORE_SLOT_ID="${RESTORE_SLOT_ID:-0}"
 STOP_EXISTING="${STOP_EXISTING:-1}"
@@ -138,14 +144,22 @@ fi
 
 echo "Starting LMCache proxy on $PUBLIC_HOST:$PUBLIC_PORT -> $BACKEND_HOST:$BACKEND_PORT"
 echo "Proxy log: $PROXY_LOG"
-python3 lmcache-proxy-on-demand.py \
-  --host "$PUBLIC_HOST" \
-  --port "$PUBLIC_PORT" \
-  --server "$BACKEND_HOST" \
-  --llama-port "$BACKEND_PORT" \
-  --cache-dir "$CACHE_DIR" \
-  --top-k "$TOP_K" \
-  > "$PROXY_LOG" 2>&1 &
+proxy_args=(
+  --host "$PUBLIC_HOST"
+  --port "$PUBLIC_PORT"
+  --server "$BACKEND_HOST"
+  --llama-port "$BACKEND_PORT"
+  --cache-dir "$CACHE_DIR"
+  --top-k "$TOP_K"
+  --min-save-tokens "$MIN_SAVE_TOKENS"
+  --prefix-cache-max-bytes "$PREFIX_CACHE_MAX_BYTES"
+  --prefix-cache-min-free-bytes "$PREFIX_CACHE_MIN_FREE_BYTES"
+)
+if [[ "$NO_AUTO_SAVE" == "1" ]]; then proxy_args+=(--no-auto-save); fi
+if [[ "$NO_PREFIX_CACHE" == "1" ]]; then proxy_args+=(--no-prefix-cache); fi
+if [[ "$ALLOW_EXACT_PREFIX_RESTORE" == "1" ]]; then proxy_args+=(--allow-exact-prefix-restore); fi
+
+python3 lmcache-proxy-on-demand.py "${proxy_args[@]}" > "$PROXY_LOG" 2>&1 &
 proxy_pid=$!
 echo "$proxy_pid" > "$PROXY_PID_FILE"
 

@@ -89,7 +89,8 @@ class LlamaClient:
         self.base_url = base_url.rstrip("/")
 
     def get_json(self, path: str, *, timeout: float = 30) -> Any:
-        with urllib.request.urlopen(self.base_url + path, timeout=timeout) as resp:
+        req = urllib.request.Request(self.base_url + path, headers={"X-LMCache-Bypass": "1"}, method="GET")
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
             return json.loads(resp.read().decode("utf-8"))
 
     def post_json(self, path: str, body: dict[str, Any], *, timeout: float = 180) -> Any:
@@ -97,7 +98,13 @@ class LlamaClient:
         req = urllib.request.Request(
             self.base_url + path,
             data=data,
-            headers={"Content-Type": "application/json"},
+            headers={
+                "Content-Type": "application/json",
+                # If this client is pointed at lmcache-proxy-on-demand instead
+                # of the backend, management calls must not recursively trigger
+                # automatic prefix-cache lookup/save.
+                "X-LMCache-Bypass": "1",
+            },
             method="POST",
         )
         with urllib.request.urlopen(req, timeout=timeout) as resp:
@@ -203,8 +210,11 @@ class PrefixCache:
             ).fetchall()
         return [int(r[0]) for r in rows]
 
-    def lookup(self, tokens: list[int], *, touch: bool = False) -> dict[str, Any] | None:
-        lengths = self.lengths_leq(len(tokens))
+    def lookup(self, tokens: list[int], *, touch: bool = False, strictly_less: bool = False) -> dict[str, Any] | None:
+        max_len = len(tokens) - 1 if strictly_less else len(tokens)
+        if max_len <= 0:
+            return None
+        lengths = self.lengths_leq(max_len)
         hashes = prefix_hashes(tokens, lengths)
         if not hashes:
             return None
@@ -230,8 +240,9 @@ class PrefixCache:
                     (utc_now(), node["id"]),
                 )
                 db.commit()
+                now = utc_now()
                 node["hits"] = int(node["hits"]) + 1
-                node["last_used"] = utc_now()
+                node["last_used"] = now
             return node
 
     def parent_for(self, tokens: list[int], node_id: str) -> str | None:

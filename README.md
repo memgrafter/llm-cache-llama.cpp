@@ -74,7 +74,13 @@ Useful environment overrides:
 | `CACHE_RAM` | `0` | Disables llama.cpp's separate multi-prompt RAM cache. |
 | `RESTORE_SLOT_ON_START` | `slot_0_current.bin` | Static slot KV file to restore into llama.cpp before the proxy starts; set empty to skip. |
 | `RESTORE_SLOT_ID` | `0` | Slot id restored at startup. |
-| `TOP_K` | `3` | KV candidates the proxy may try per prompt. |
+| `TOP_K` | `3` | Legacy KV candidates the proxy may try per prompt. |
+| `MIN_SAVE_TOKENS` | `256` | Minimum saved-token count before automatic prefix-cache autosave. |
+| `PREFIX_CACHE_MAX_BYTES` | `2GiB` | Trie-backed prefix-cache size limit; leaf nodes are pruned to stay under it. |
+| `PREFIX_CACHE_MIN_FREE_BYTES` | `512MiB` | Minimum filesystem free space required before autosave; the proxy prunes or skips gracefully below it. |
+| `NO_AUTO_SAVE` | `0` | Set `1` to restore prefixes but skip automatic saves. |
+| `NO_PREFIX_CACHE` | `0` | Set `1` to disable trie-backed prefix cache. |
+| `ALLOW_EXACT_PREFIX_RESTORE` | `0` | Set `1` only after the llama.cpp exact-prefix restore crash is fixed. |
 | `STOP_EXISTING` | `1` | Clear existing listeners on the public/backend ports before launch. |
 
 Example with logs and custom ports:
@@ -115,7 +121,10 @@ python3 lmcache-proxy-on-demand.py \
   --server 127.0.0.1 \
   --llama-port 8082 \
   --cache-dir ~/.cache/llama.cpp-launch-scripts/slot-kv \
-  --top-k 3
+  --top-k 3 \
+  --min-save-tokens 256 \
+  --prefix-cache-max-bytes 2GiB \
+  --prefix-cache-min-free-bytes 512MiB
 ```
 
 Flags:
@@ -127,9 +136,15 @@ Flags:
 | `--server` | llama.cpp backend host. |
 | `--llama-port` | llama.cpp backend port. |
 | `--cache-dir` | Disk KV cache directory. |
-| `--top-k` | Maximum cached KV candidates to try per prompt. |
+| `--top-k` | Legacy cache fallback candidate count. |
+| `--min-save-tokens` | Minimum saved-token count before automatic prefix-cache autosave. |
+| `--prefix-cache-max-bytes` | Trie-backed prefix-cache size limit. |
+| `--prefix-cache-min-free-bytes` | Minimum filesystem free space before autosave. |
+| `--no-auto-save` | Restore matching prefixes but do not save completed requests. |
+| `--no-prefix-cache` | Disable trie-backed prefix-cache integration. |
+| `--allow-exact-prefix-restore` | Allow exact-length prefix restores; unsafe on the current llama.cpp build. |
 
-On each request, the proxy extracts prompt text, checks for matching KV files in `--cache-dir`, restores a compatible match into an idle slot, then forwards the request to llama.cpp.
+On each request, the proxy renders/tokenizes the prompt, restores the best strict-prefix trie node into slot 0, forwards the original request unchanged, streams the response, then autosaves the completed slot into the trie. Static `slot_0_current.bin` remains separate.
 
 ### `run-qwen36-reap.sh` — backend only
 

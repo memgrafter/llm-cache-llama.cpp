@@ -2,76 +2,140 @@
 
 ## Current state
 
-The repo now has three related paths:
+The prefix cache is now integrated into the supervised llama.cpp proxy stack.
 
-1. **Static slot path**
+There are two separate slot-KV paths:
+
+1. **Static/manual slot**
    - File: `slot_0_current.bin`
    - Used by `run-lmcache-proxy-stack.sh`, `save-slot.sh`, and `restore-slot.sh`.
-   - This is intentionally simple and separate from trie/cache pruning.
+   - This remains separate from trie pruning and automatic prefix-cache nodes.
 
-2. **Supervised proxy stack**
-   - Entry point: `./run-lmcache-proxy-stack.sh`
-   - Public endpoint: `127.0.0.1:8081`
-   - Private llama.cpp backend: `127.0.0.1:8082`
-   - If proxy stops, supervisor stops llama.cpp. If llama.cpp stops, supervisor stops proxy.
-   - Startup restore defaults to `slot_0_current.bin`.
+2. **Automatic trie-backed prefix cache**
+   - Metadata: `~/.cache/llama.cpp-launch-scripts/slot-kv/trie/prefix-cache.sqlite`
+   - KV bins: `~/.cache/llama.cpp-launch-scripts/slot-kv/prefix_node_<node-id>.bin`
+   - Temp save files: `prefix_tmp_<time-ns>.bin`, renamed after the saved token count is known.
+   - Hashing: `blake2b-128-le-u32-v1` over little-endian uint32 token IDs.
 
-3. **Experimental prefix trie metadata tool**
-   - File: `prefix_cache.py`
-   - SQLite metadata DB:
-     `~/.cache/llama.cpp-launch-scripts/slot-kv/trie/prefix-cache.sqlite`
-   - KV bins remain as normal flat files in the llama.cpp slot-save directory:
-     `~/.cache/llama.cpp-launch-scripts/slot-kv/prefix_node_<node-id>.bin`
-   - This is intentionally flat because the llama.cpp slot save/restore API may reject filenames containing path separators.
-   - Hashing: `blake2b-128-le-u32-v1`, streamed over little-endian uint32 token IDs with O(1) extra memory.
+## Implemented proxy behavior
 
-## Important verified behavior
+`lmcache-proxy-on-demand.py` now does the full automatic loop:
 
-### Save/restore works
+1. Render/tokenize incoming prompt.
+   - `/completion`: uses `body["prompt"]`.
+   - `/v1/chat/completions`: calls backend `/apply-template`, then `/tokenize`.
+2. Lookup the best trie node in `PrefixCache`.
+3. Restore the matching node into slot `0`.
+4. Forward the original request unchanged.
+5. Stream the backend response through to the client.
+6. After the response completes, save slot `0` into a new trie node.
+7. Prune to the configured size limit.
 
-Static slot roundtrip works:
+Important: the proxy forwards the original request unchanged. llama.cpp still owns prompt reuse semantics after restore.
 
-```text
-save slot -> restore slot -> save slot -> cmp
+## Defaults / knobs
+
+`run-lmcache-proxy-stack.sh` now passes these proxy settings:
+
+```bash
+MIN_SAVE_TOKENS=256
+PREFIX_CACHE_MAX_BYTES=2GiB
+PREFIX_CACHE_MIN_FREE_BYTES=512MiB
+NO_AUTO_SAVE=0
+NO_PREFIX_CACHE=0
+ALLOW_EXACT_PREFIX_RESTORE=0
 ```
 
-Validated with `slot_0_current.bin` and `cmp 0`.
+Proxy flags:
 
-### llama.cpp does prefix reuse after restore
-
-Verified using a 3601-token prefix bin:
-
-```text
-restore prefix bin
-send prefix + 23-token suffix
+```bash
+--min-save-tokens N
+--prefix-cache-max-bytes BYTES
+--prefix-cache-min-free-bytes BYTES
+--no-auto-save
+--no-prefix-cache
+--allow-exact-prefix-restore
 ```
 
-llama.cpp reported:
+## Exact-prefix safety
+
+Exact-length restores are disabled by default:
 
 ```text
-cache_n = 3601
-prompt_n = 23
+node.token_count < incoming.token_count
 ```
 
-So the proxy does not need to slice prompts. It only needs to choose and restore the best prefix bin; llama.cpp handles suffix evaluation.
+Reason: this llama.cpp/TurboQuant build can crash on exact-prefix restore. Once fixed upstream, remove this guard or start the proxy with:
 
-### Exact-prefix edge case
+```bash
+ALLOW_EXACT_PREFIX_RESTORE=1 ./run-lmcache-proxy-stack.sh
+```
 
-A request whose prompt exactly matches a restored 3601-token slot crashed this TurboQuant llama.cpp build:
+## Streaming autosave detail
+
+Streaming is supported and is the main autosave path.
+
+For llama.cpp `/completion` streaming responses, the final saved slot usually contains:
 
 ```text
-need to evaluate at least 1 token
-n_past was set to 3600
-failed to remove sequence 0 with p0=3600, p1=-1
+prompt tokens + generated tokens except the last generated token
 ```
 
-Tracked in `todo.txt`. Treat as a llama.cpp/test nuance, not a blocker for suffix-prefix reuse.
+That is expected: the last sampled token has been emitted, but its KV may not be present until it is evaluated as input for the next token. The proxy therefore saves to a temp filename first, reads `n_saved`, reconstructs the exact saved token prefix from streamed token IDs, then renames the bin to the final node filename.
+
+## Storage behavior
+
+Before autosave, the proxy:
+
+1. prunes trie cache to `PREFIX_CACHE_MAX_BYTES`, default `2GiB`,
+2. checks filesystem free space,
+3. if free space is below `PREFIX_CACHE_MIN_FREE_BYTES`, default `512MiB`, prunes additional leaf nodes,
+4. if nothing is prunable and storage is still low, skips autosave gracefully.
+
+Static `slot_0_current.bin` is not pruned by this logic.
+
+## Management bypass
+
+`prefix_cache.py` sends:
+
+```text
+X-LMCache-Bypass: 1
+```
+
+This prevents management operations like `prefix_cache.py add` from recursively triggering proxy autosave when pointed at the public proxy URL.
+
+## Verified live behavior
+
+Live stack was restarted with:
+
+```bash
+MIN_SAVE_TOKENS=1 ./run-lmcache-proxy-stack.sh
+```
+
+A streaming `/completion` request autosaved a node:
+
+```text
+prefix-cache autosaved node 41-... (41 tokens, 63.1 MiB)
+```
+
+A later longer streaming request restored that node before forwarding:
+
+```text
+prefix-cache restored node 41-... (41 tokens)
+```
+
+With normal `cache_prompt` behavior, llama.cpp reported reuse on a subsequent request:
+
+```text
+cache_n = 53
+prompt_n = 10
+```
+
+If the client sends `cache_prompt: false`, llama.cpp can still accept the restore but reports `cache_n = 0`; the proxy intentionally does not rewrite this client setting.
 
 ## Tests
 
-Unit + integration tests exist.
-
-Default run:
+Default suite:
 
 ```bash
 python3 -m unittest discover -s tests -p 'test_*.py' -v
@@ -80,92 +144,24 @@ python3 -m unittest discover -s tests -p 'test_*.py' -v
 Current default result:
 
 ```text
-31 tests OK, 3 live integration tests skipped
+34 tests OK, 3 live tests skipped
 ```
 
-Live integration tests are gated:
+Live prefix-cache contract:
 
 ```bash
 RUN_LIVE_PREFIX_CACHE_TESTS=1 python3 -m unittest tests/test_prefix_cache_integration.py -v
 ```
 
-They intentionally touch the real service and should be run deliberately.
-
-## `prefix_cache.py` commands
-
-```bash
-./prefix_cache.py init
-./prefix_cache.py add --label NAME --prompt-file prompt.txt
-./prefix_cache.py lookup --prompt-file prompt.txt
-./prefix_cache.py list
-./prefix_cache.py prune --max-bytes N
-```
-
-The tool currently expects already-rendered prompt text for `add` and `lookup`.
-
-## Next step
-
-Yes: the next implementation step is to integrate `prefix_cache.py` into the **on-demand proxy path**.
-
-The target file should be:
+Current live result:
 
 ```text
-lmcache-proxy-on-demand.py
+6 tests OK
 ```
 
-Not the older background-thread proxy unless you intentionally revive that design.
+## Remaining work
 
-## Minimal proxy integration plan
-
-At request time in `LMCacheHandler._handle_request()`:
-
-1. Parse body as it does today.
-2. Build the exact prompt text for lookup:
-   - For `/completion`, use `body["prompt"]`.
-   - For `/v1/chat/completions`, call backend `/apply-template` with `messages` to get the same rendered prompt llama.cpp will tokenize.
-3. Tokenize rendered prompt through backend `/tokenize`.
-4. Use `PrefixCache.lookup(tokens, touch=True)`.
-5. If a node is found:
-   - Restore `node["bin_file"]` into slot 0.
-   - Forward the original request unchanged.
-6. If no node is found:
-   - Forward unchanged.
-
-Important: do not modify the original request. llama.cpp should see the full prompt and use its own LCP/prefix reuse after the restore.
-
-## What not to do yet
-
-- Do not remove the static `slot_0_current.bin` path.
-- Do not put KV blobs inside SQLite.
-- Do not implement automatic cache creation after every request yet.
-- Do not implement aggressive pruning beyond leaf-only pruning.
-- Do not rely on raw OpenAI JSON for hashes; use rendered prompt text or token IDs.
-
-## Open design questions
-
-1. **Rendered prompt source**
-   - Preferred: backend `/apply-template` then `/tokenize`.
-   - For `/completion`, direct prompt string is already rendered/plain.
-
-2. **Automatic node creation**
-   - Later: after a long request finishes, save useful prefix boundaries into trie.
-   - For now: manual `prefix_cache.py add` is safer.
-
-3. **Boundary selection**
-   - Semantic boundaries are better than fixed intervals: system prompt, developer prompt, tool schema, AGENTS/project context, etc.
-   - Fixed ladder nodes may still be useful for long conversations.
-
-4. **Pruning**
-   - Keep trunk/shared nodes.
-   - Prune leaves first by old `last_used`, low `hits`, and high `size_bytes`.
-
-## Suggested first proxy integration test
-
-Mock-backed test:
-
-1. Create trie node for `prefix`.
-2. Send request with `prefix + suffix` through proxy.
-3. Assert proxy calls backend restore for the trie node before forwarding.
-4. Assert original request body is forwarded unchanged.
-
-Live-backed test can come after that and should remain opt-in.
+- Upstream/fix exact-prefix restore crash, then remove `strict_prefix_restore` guard.
+- Add broader contract tests beyond the current 3 behavior groups.
+- Add chat-specific live automatic-loop test using `/v1/chat/completions` and `/apply-template`.
+- Consider a threaded HTTP server if concurrent streaming clients become necessary.

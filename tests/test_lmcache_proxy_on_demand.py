@@ -3,10 +3,13 @@ import importlib.util
 import io
 import json
 import pathlib
+import shutil
 import sys
 import tempfile
 import unittest
 from unittest import mock
+
+import prefix_cache
 
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -262,11 +265,157 @@ class LMCacheProxyOnDemandTests(unittest.TestCase):
         self.assertIsNotNone(result)
         self.assertEqual(result["context_size"], 0)
 
+
     def test_get_server_model_info_missing_endpoint(self):
         """When health endpoint raises, _get_server_model_info returns None."""
         with mock.patch.object(lmcache.urllib.request, "urlopen", side_effect=Exception("timeout")):
             result = lmcache._get_server_model_info("localhost", 8081)
         self.assertIsNone(result)
+
+    def test_prefix_cache_restores_strict_prefix_and_autosaves_stream_result(self):
+        with tempfile.TemporaryDirectory() as cache_dir_str:
+            cache_dir = pathlib.Path(cache_dir_str)
+            cache = prefix_cache.PrefixCache(cache_dir)
+            cache.init()
+
+            prefix_text = "hello world"
+            request_prompt = "hello world suffix"
+            generated = " generated"
+            prefix_tokens = list(prefix_text.encode("utf-8"))
+            parent_id, digest = prefix_cache.node_id_for(prefix_tokens)
+            parent_bin = cache.relative_node_bin(parent_id)
+            cache.absolute_bin_path(parent_bin).write_bytes(b"parent")
+            cache.insert_node({
+                "id": parent_id,
+                "parent_id": None,
+                "label": "parent",
+                "boundary": "manual",
+                "token_count": len(prefix_tokens),
+                "prefix_hash": digest,
+                "hash_algo": prefix_cache.HASH_ALGO,
+                "bin_file": parent_bin,
+                "size_bytes": 6,
+                "n_saved": len(prefix_tokens),
+                "created_at": prefix_cache.utc_now(),
+            })
+
+            handler, body_bytes = self._make_handler({"prompt": request_prompt, "stream": True})
+            handler._forward = mock.Mock(return_value=lmcache.ForwardResult(
+                200,
+                "text/event-stream",
+                b'data: {"choices":[{"delta":{"content":" generated"}}]}\n\ndata: [DONE]\n\n',
+            ))
+            handler.prefix_cache_obj = cache
+            handler.cache_dir_obj = None
+            handler.auto_save_enabled = True
+            handler.prefix_cache_enabled = True
+            handler.min_save_tokens = 1
+            handler.max_cache_bytes = 2 * lmcache.GIB
+            handler.min_free_bytes = 1
+            handler.strict_prefix_restore = True
+            handler.slot_id = 0
+
+            def fake_call(method, path, body=None, server="localhost", port=8081, timeout=30):
+                if path == "/tokenize":
+                    return {"tokens": list(body["content"].encode("utf-8"))}
+                if path == "/props":
+                    return {"model_alias": "mock", "model_path": "/tmp/mock.gguf", "default_generation_settings": {"n_ctx": 4096}}
+                raise AssertionError((method, path, body))
+
+            def fake_save(slot_id, bin_file, server="localhost", port=8081):
+                saved_tokens = list((request_prompt + generated).encode("utf-8"))
+                cache.absolute_bin_path(bin_file).write_bytes(b"saved")
+                return {"n_saved": len(saved_tokens), "filename": bin_file}
+
+            with mock.patch.object(lmcache, "_call_llama", side_effect=fake_call), \
+                 mock.patch.object(lmcache, "_restore_slot", return_value={"n_restored": len(prefix_tokens)}) as restore, \
+                 mock.patch.object(lmcache, "_save_slot", side_effect=fake_save) as save:
+                handler._handle_request("POST")
+
+            restore.assert_called_once_with(0, parent_bin, "localhost", 8081)
+            handler._forward.assert_called_once_with("POST", "/completion", body_bytes)
+            save.assert_called_once()
+
+            saved_tokens = list((request_prompt + generated).encode("utf-8"))
+            saved_id, _ = prefix_cache.node_id_for(saved_tokens)
+            saved_node = cache.get_node(saved_id)
+            self.assertIsNotNone(saved_node)
+            self.assertEqual(saved_node["parent_id"], parent_id)
+            self.assertEqual(saved_node["token_count"], len(saved_tokens))
+
+    def test_prefix_cache_does_not_restore_exact_match_by_default(self):
+        with tempfile.TemporaryDirectory() as cache_dir_str:
+            cache = prefix_cache.PrefixCache(pathlib.Path(cache_dir_str))
+            cache.init()
+            prompt = "exact prompt"
+            tokens = list(prompt.encode("utf-8"))
+            node_id, digest = prefix_cache.node_id_for(tokens)
+            bin_file = cache.relative_node_bin(node_id)
+            cache.absolute_bin_path(bin_file).write_bytes(b"exact")
+            cache.insert_node({
+                "id": node_id,
+                "parent_id": None,
+                "label": "exact",
+                "boundary": "manual",
+                "token_count": len(tokens),
+                "prefix_hash": digest,
+                "hash_algo": prefix_cache.HASH_ALGO,
+                "bin_file": bin_file,
+                "size_bytes": 5,
+                "n_saved": len(tokens),
+                "created_at": prefix_cache.utc_now(),
+            })
+
+            handler, body_bytes = self._make_handler({"prompt": prompt})
+            handler._forward = mock.Mock(return_value=lmcache.ForwardResult(200, "application/json", b'{"content":""}'))
+            handler.prefix_cache_obj = cache
+            handler.cache_dir_obj = None
+            handler.auto_save_enabled = False
+            handler.prefix_cache_enabled = True
+            handler.strict_prefix_restore = True
+
+            def fake_call(method, path, body=None, server="localhost", port=8081, timeout=30):
+                if path == "/tokenize":
+                    return {"tokens": list(body["content"].encode("utf-8"))}
+                raise AssertionError((method, path, body))
+
+            with mock.patch.object(lmcache, "_call_llama", side_effect=fake_call), \
+                 mock.patch.object(lmcache, "_restore_slot", return_value={"n_restored": len(tokens)}) as restore:
+                handler._handle_request("POST")
+
+            restore.assert_not_called()
+            handler._forward.assert_called_once_with("POST", "/completion", body_bytes)
+
+    def test_prefix_cache_low_storage_skips_autosave_gracefully(self):
+        with tempfile.TemporaryDirectory() as cache_dir_str:
+            cache = prefix_cache.PrefixCache(pathlib.Path(cache_dir_str))
+            cache.init()
+            handler, _ = self._make_handler({"prompt": "short", "stream": True})
+            handler.prefix_cache_obj = cache
+            handler.auto_save_enabled = True
+            handler.min_save_tokens = 1
+            handler.min_free_bytes = 999999999999
+            handler.max_cache_bytes = 2 * lmcache.GIB
+            ctx = lmcache.RequestCacheContext("short", list(b"short"))
+            result = lmcache.ForwardResult(
+                200,
+                "text/event-stream",
+                b'data: {"choices":[{"delta":{"content":" out"}}]}\n\ndata: [DONE]\n\n',
+            )
+
+            def fake_call(method, path, body=None, server="localhost", port=8081, timeout=30):
+                if path == "/tokenize":
+                    return {"tokens": list(body["content"].encode("utf-8"))}
+                raise AssertionError((method, path, body))
+
+            usage = shutil._ntuple_diskusage(total=1000, used=999, free=1)
+            with mock.patch.object(lmcache, "_call_llama", side_effect=fake_call), \
+                 mock.patch.object(lmcache.shutil, "disk_usage", return_value=usage), \
+                 mock.patch.object(lmcache, "_save_slot") as save:
+                handler._auto_save_prefix_cache(ctx, {"prompt": "short", "stream": True}, result)
+
+            save.assert_not_called()
+            self.assertEqual(cache.list_nodes(), [])
 
 
 if __name__ == "__main__":
