@@ -80,10 +80,28 @@ class KVCache:
 
 
 @dataclass
+class AnchorConfig:
+    label: str
+    marker: str
+    occurrence: int = 1
+    side: str = "after"
+    pinned: bool = True
+
+
+@dataclass
+class RequestAnchor:
+    config: AnchorConfig
+    text: str
+    tokens: list[int]
+
+
+@dataclass
 class RequestCacheContext:
     prompt_text: str
     prompt_tokens: list[int]
+    anchors: list[RequestAnchor]
     restored_node_id: str | None = None
+    restored_via: str | None = None
 
 
 @dataclass
@@ -124,6 +142,14 @@ def _save_slot(slot_id: int, kv_path: str, server: str = "localhost", port: int 
     return result
 
 
+def _erase_slot(slot_id: int, server: str = "localhost", port: int = 8081):
+    path = f"/slots/{slot_id}?action=erase"
+    result = _call_llama("POST", path, {"n_keep": 0}, server, port, timeout=180)
+    if result:
+        log.info("erased KV slot %d", slot_id)
+    return result
+
+
 def _get_server_model_info(server: str, port: int) -> dict | None:
     """Get compatibility info for the legacy cache path."""
     try:
@@ -160,6 +186,7 @@ class LMCacheHandler(BaseHTTPRequestHandler):
     max_cache_bytes = 2 * GIB
     min_free_bytes = 512 * MIB
     strict_prefix_restore = True
+    anchor_configs: list[AnchorConfig] = []
 
     def _forward(self, method: str, path: str, body_bytes: bytes) -> ForwardResult | None:
         """Forward request to llama.cpp, streaming response chunks to the client."""
@@ -271,6 +298,37 @@ class LMCacheHandler(BaseHTTPRequestHandler):
             log.warning("unexpected /apply-template response: %r", res)
         return None
 
+    @staticmethod
+    def _find_marker_boundary(text: str, cfg: AnchorConfig) -> int | None:
+        if not cfg.marker or cfg.occurrence <= 0:
+            return None
+        start = 0
+        pos = -1
+        for _ in range(cfg.occurrence):
+            pos = text.find(cfg.marker, start)
+            if pos < 0:
+                return None
+            start = pos + len(cfg.marker)
+        if cfg.side == "before":
+            return pos
+        if cfg.side == "after":
+            return pos + len(cfg.marker)
+        log.warning("unknown anchor side %r for %s", cfg.side, cfg.label)
+        return None
+
+    def _anchors_for_prompt(self, prompt_text: str) -> list[RequestAnchor]:
+        anchors: list[RequestAnchor] = []
+        for cfg in self.anchor_configs:
+            end = self._find_marker_boundary(prompt_text, cfg)
+            if end is None or end <= 0:
+                continue
+            text = prompt_text[:end]
+            tokens = self._tokenize(text)
+            if not tokens:
+                continue
+            anchors.append(RequestAnchor(config=cfg, text=text, tokens=tokens))
+        return anchors
+
     def _request_cache_context(self, path: str, body: dict) -> RequestCacheContext | None:
         if not self.prefix_cache_enabled or self.prefix_cache_obj is None:
             return None
@@ -280,7 +338,100 @@ class LMCacheHandler(BaseHTTPRequestHandler):
         tokens = self._tokenize(prompt_text)
         if not tokens:
             return None
-        return RequestCacheContext(prompt_text=prompt_text, prompt_tokens=tokens)
+        anchors = self._anchors_for_prompt(prompt_text)
+        return RequestCacheContext(prompt_text=prompt_text, prompt_tokens=tokens, anchors=anchors)
+
+    def _materialize_anchor_once(self, anchor: RequestAnchor) -> dict | None:
+        cache = self.prefix_cache_obj
+        if cache is None:
+            return None
+        existing = cache.lookup_materialized_anchor(label=anchor.config.label, tokens=anchor.tokens, touch=True)
+        if existing:
+            return existing
+        if not self._ensure_storage_room():
+            return None
+
+        node_id, digest = prefix_cache.anchor_node_id_for(anchor.config.label, anchor.tokens)
+        if cache.get_node(node_id):
+            return cache.lookup_materialized_anchor(label=anchor.config.label, tokens=anchor.tokens, touch=True)
+
+        bin_file = cache.relative_node_bin(node_id)
+        bin_path = cache.absolute_bin_path(bin_file)
+        if bin_path.exists():
+            log.warning("prefix-cache anchor materialize skipped: bin exists without DB node: %s", bin_path)
+            return None
+
+        if not _erase_slot(self.slot_id, self.llama_server, self.llama_port):
+            return None
+        prefill = _call_llama(
+            "POST",
+            "/completion",
+            {"prompt": anchor.text, "n_predict": 0, "stream": False, "cache_prompt": False},
+            self.llama_server,
+            self.llama_port,
+            timeout=600,
+        )
+        if not isinstance(prefill, dict):
+            return None
+
+        tmp_file = f"prefix_anchor_tmp_{time.time_ns()}.bin"
+        tmp_path = cache.absolute_bin_path(tmp_file)
+        save = _save_slot(self.slot_id, tmp_file, self.llama_server, self.llama_port)
+        if not isinstance(save, dict):
+            return None
+        n_saved = int(save.get("n_saved", -1))
+        if n_saved != len(anchor.tokens):
+            log.warning("prefix-cache anchor materialize skipped: n_saved=%d anchor_tokens=%d", n_saved, len(anchor.tokens))
+            try:
+                tmp_path.unlink()
+            except FileNotFoundError:
+                pass
+            _erase_slot(self.slot_id, self.llama_server, self.llama_port)
+            return None
+        if not tmp_path.exists():
+            log.warning("prefix-cache anchor materialize skipped: save succeeded but bin is missing: %s", tmp_path)
+            return None
+        tmp_path.rename(bin_path)
+        size_bytes = bin_path.stat().st_size
+
+        props = self._props()
+        settings = props.get("default_generation_settings", {}) if isinstance(props, dict) else {}
+        node = {
+            "id": node_id,
+            "parent_id": cache.parent_for(anchor.tokens, node_id),
+            "label": anchor.config.label,
+            "boundary": "anchor",
+            "token_count": len(anchor.tokens),
+            "prefix_hash": digest,
+            "hash_algo": prefix_cache.HASH_ALGO,
+            "bin_file": bin_file,
+            "size_bytes": size_bytes,
+            "n_saved": n_saved,
+            "model_alias": props.get("model_alias") if isinstance(props, dict) else None,
+            "model_path": props.get("model_path") if isinstance(props, dict) else None,
+            "ctx_size": settings.get("n_ctx") if isinstance(settings, dict) else None,
+            "hits": 0,
+            "created_at": prefix_cache.utc_now(),
+            "last_used": None,
+            "pinned": anchor.config.pinned,
+            "meta": {"source": "lmcache-proxy-on-demand", "prefill_response": prefill},
+        }
+        cache.insert_node(node)
+        cache.insert_anchor({
+            "node_id": node_id,
+            "label": anchor.config.label,
+            "token_count": len(anchor.tokens),
+            "prefix_hash": digest,
+            "hash_algo": prefix_cache.HASH_ALGO,
+            "marker": anchor.config.marker,
+            "occurrence": anchor.config.occurrence,
+            "side": anchor.config.side,
+            "pinned": anchor.config.pinned,
+            "created_at": prefix_cache.utc_now(),
+            "meta": {"materialized": True},
+        })
+        log.info("prefix-cache materialized anchor node %s (%d tokens, %.1f MiB)", node_id, len(anchor.tokens), size_bytes / MIB)
+        return cache.get_node(node_id)
 
     def _lookup_and_restore_prefix(self, ctx: RequestCacheContext) -> None:
         cache = self.prefix_cache_obj
@@ -288,12 +439,33 @@ class LMCacheHandler(BaseHTTPRequestHandler):
             return
         cache.init()
         node = cache.lookup(ctx.prompt_tokens, touch=True, strictly_less=self.strict_prefix_restore)
-        if not node:
+        via = "full-prefix"
+        if node and node.get("boundary") == "anchor":
+            via = "materialized-anchor"
+        if node:
+            result = _restore_slot(self.slot_id, node["bin_file"], self.llama_server, self.llama_port)
+            if result:
+                ctx.restored_node_id = node["id"]
+                ctx.restored_via = via
+                log.info("prefix-cache restored node %s (%s tokens) via %s", node["id"], node["token_count"], via)
             return
-        result = _restore_slot(self.slot_id, node["bin_file"], self.llama_server, self.llama_port)
-        if result:
-            ctx.restored_node_id = node["id"]
-            log.info("prefix-cache restored node %s (%s tokens)", node["id"], node["token_count"])
+
+        for anchor in sorted(ctx.anchors, key=lambda a: len(a.tokens), reverse=True):
+            node = cache.lookup_materialized_anchor(label=anchor.config.label, tokens=anchor.tokens, touch=True)
+            if node:
+                result = _restore_slot(self.slot_id, node["bin_file"], self.llama_server, self.llama_port)
+                if result:
+                    ctx.restored_node_id = node["id"]
+                    ctx.restored_via = f"anchor:{anchor.config.label}"
+                    log.info("prefix-cache restored node %s (%s tokens) via %s", node["id"], node["token_count"], ctx.restored_via)
+                return
+
+            node = self._materialize_anchor_once(anchor)
+            if node:
+                ctx.restored_node_id = node["id"]
+                ctx.restored_via = f"anchor-materialized:{anchor.config.label}"
+                log.info("prefix-cache using newly materialized anchor node %s (%s tokens)", node["id"], node["token_count"])
+                return
 
     def _restore_legacy_cache(self, body: dict) -> None:
         if self.prefix_cache_obj is not None or self.cache_dir_obj is None:
@@ -430,8 +602,23 @@ class LMCacheHandler(BaseHTTPRequestHandler):
             },
         }
         cache.insert_node(node)
+        for anchor in ctx.anchors:
+            anchor_id, anchor_digest = prefix_cache.node_id_for(anchor.tokens)
+            cache.insert_anchor({
+                "node_id": node_id,
+                "label": anchor.config.label,
+                "token_count": len(anchor.tokens),
+                "prefix_hash": anchor_digest,
+                "hash_algo": prefix_cache.HASH_ALGO,
+                "marker": anchor.config.marker,
+                "occurrence": anchor.config.occurrence,
+                "side": anchor.config.side,
+                "pinned": anchor.config.pinned,
+                "created_at": prefix_cache.utc_now(),
+                "meta": {"anchor_id": anchor_id},
+            })
         cache.prune(max_bytes=self.max_cache_bytes, max_nodes=None, dry_run=False)
-        log.info("prefix-cache autosaved node %s (%d tokens, %.1f MiB)", node_id, len(tokens), size_bytes / MIB)
+        log.info("prefix-cache autosaved node %s (%d tokens, %.1f MiB, anchors=%d)", node_id, len(tokens), size_bytes / MIB, len(ctx.anchors))
 
     def _handle_request(self, method: str):
         content_length = int(self.headers.get("Content-Length", 0))
@@ -539,8 +726,19 @@ def main():
     cache_dir = pathlib.Path(args.cache_dir).expanduser()
     legacy_cache = KVCache(str(cache_dir), top_k=args.top_k)
     trie_cache = None if args.no_prefix_cache else prefix_cache.PrefixCache(cache_dir)
+    anchor_configs: list[AnchorConfig] = []
     if trie_cache is not None:
         trie_cache.init()
+        anchor_configs = [
+            AnchorConfig(
+                label=str(row["label"]),
+                marker=str(row["marker"]),
+                occurrence=int(row["occurrence"]),
+                side=str(row["side"]),
+                pinned=bool(row["pinned"]),
+            )
+            for row in trie_cache.list_anchor_configs()
+        ]
 
     LMCacheHandler.llama_server = args.server
     LMCacheHandler.llama_port = args.llama_port
@@ -554,6 +752,7 @@ def main():
     LMCacheHandler.max_cache_bytes = args.prefix_cache_max_bytes
     LMCacheHandler.min_free_bytes = args.prefix_cache_min_free_bytes
     LMCacheHandler.strict_prefix_restore = not args.allow_exact_prefix_restore
+    LMCacheHandler.anchor_configs = anchor_configs
 
     LMCacheHandler.server_model_info = _get_server_model_info(args.server, args.llama_port)
     if LMCacheHandler.server_model_info:
@@ -566,12 +765,13 @@ def main():
     log.info("KV cache dir: %s", cache_dir)
     if trie_cache is not None:
         log.info(
-            "prefix cache enabled: min_save_tokens=%d max_bytes=%d min_free_bytes=%d strict_prefix_restore=%s auto_save=%s",
+            "prefix cache enabled: min_save_tokens=%d max_bytes=%d min_free_bytes=%d strict_prefix_restore=%s auto_save=%s anchors=%d",
             args.min_save_tokens,
             args.prefix_cache_max_bytes,
             args.prefix_cache_min_free_bytes,
             not args.allow_exact_prefix_restore,
             not args.no_auto_save,
+            len(anchor_configs),
         )
 
     try:

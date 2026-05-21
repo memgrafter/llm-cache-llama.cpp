@@ -49,6 +49,10 @@ class PrefixCacheTests(unittest.TestCase):
             self.assertEqual(cache.list_nodes(), [])
             self.assertEqual(cache.total_bytes(), 0)
             self.assertTrue(cache.db_path.exists())
+            configs = cache.list_anchor_configs()
+            self.assertEqual(len(configs), 1)
+            self.assertEqual(configs[0]["label"], "end-of-system-message")
+            self.assertEqual(configs[0]["marker"], "<|im_end|>")
 
     def test_lookup_returns_longest_matching_prefix(self):
         with tempfile.TemporaryDirectory() as d:

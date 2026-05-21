@@ -84,6 +84,12 @@ def node_id_for(tokens: list[int]) -> tuple[str, str]:
     return f"{len(tokens)}-{digest}", digest
 
 
+def anchor_node_id_for(label: str, tokens: list[int]) -> tuple[str, str]:
+    base_id, digest = node_id_for(tokens)
+    label_hash = hashlib.blake2b(label.encode("utf-8"), digest_size=4).hexdigest()
+    return f"anchor-{label_hash}-{base_id}", digest
+
+
 class LlamaClient:
     def __init__(self, base_url: str):
         self.base_url = base_url.rstrip("/")
@@ -178,8 +184,54 @@ class PrefixCache:
                 CREATE INDEX IF NOT EXISTS idx_nodes_token_hash ON nodes(token_count, prefix_hash);
                 CREATE INDEX IF NOT EXISTS idx_nodes_parent ON nodes(parent_id);
                 CREATE INDEX IF NOT EXISTS idx_nodes_prune ON nodes(pinned, last_used, hits, size_bytes);
+
+                CREATE TABLE IF NOT EXISTS anchors (
+                    node_id TEXT NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
+                    label TEXT NOT NULL,
+                    token_count INTEGER NOT NULL,
+                    prefix_hash TEXT NOT NULL,
+                    hash_algo TEXT NOT NULL,
+                    marker TEXT NOT NULL,
+                    occurrence INTEGER NOT NULL,
+                    side TEXT NOT NULL,
+                    pinned INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL,
+                    meta_json TEXT NOT NULL DEFAULT '{}',
+                    PRIMARY KEY (label, token_count, prefix_hash, node_id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_anchors_lookup ON anchors(label, token_count, prefix_hash);
+                CREATE INDEX IF NOT EXISTS idx_anchors_node ON anchors(node_id);
+
+                CREATE TABLE IF NOT EXISTS anchor_configs (
+                    label TEXT PRIMARY KEY,
+                    marker TEXT NOT NULL,
+                    occurrence INTEGER NOT NULL,
+                    side TEXT NOT NULL,
+                    pinned INTEGER NOT NULL DEFAULT 1,
+                    enabled INTEGER NOT NULL DEFAULT 1,
+                    created_at TEXT NOT NULL,
+                    meta_json TEXT NOT NULL DEFAULT '{}'
+                );
                 """
             )
+            db.execute(
+                """
+                INSERT OR IGNORE INTO anchor_configs (
+                    label, marker, occurrence, side, pinned, enabled, created_at, meta_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    "end-of-system-message",
+                    "<|im_end|>",
+                    1,
+                    "after",
+                    1,
+                    1,
+                    utc_now(),
+                    json.dumps({"description": "prefix through first chat-template end-of-message marker"}, sort_keys=True),
+                ),
+            )
+            db.commit()
 
     def connect(self) -> sqlite3.Connection:
         self.trie_dir.mkdir(parents=True, exist_ok=True)
@@ -210,6 +262,16 @@ class PrefixCache:
             ).fetchall()
         return [int(r[0]) for r in rows]
 
+    @staticmethod
+    def touch_node_in_db(db: sqlite3.Connection, node: dict[str, Any]) -> None:
+        now = utc_now()
+        db.execute(
+            "UPDATE nodes SET hits = hits + 1, last_used = ? WHERE id = ?",
+            (now, node["id"]),
+        )
+        node["hits"] = int(node["hits"]) + 1
+        node["last_used"] = now
+
     def lookup(self, tokens: list[int], *, touch: bool = False, strictly_less: bool = False) -> dict[str, Any] | None:
         max_len = len(tokens) - 1 if strictly_less else len(tokens)
         if max_len <= 0:
@@ -235,14 +297,105 @@ class PrefixCache:
 
             node = dict(best)
             if touch:
-                db.execute(
-                    "UPDATE nodes SET hits = hits + 1, last_used = ? WHERE id = ?",
-                    (utc_now(), node["id"]),
-                )
+                self.touch_node_in_db(db, node)
                 db.commit()
-                now = utc_now()
-                node["hits"] = int(node["hits"]) + 1
-                node["last_used"] = now
+            return node
+
+    def list_anchor_configs(self) -> list[dict[str, Any]]:
+        self.init()
+        with contextlib.closing(self.connect()) as db:
+            rows = db.execute(
+                """
+                SELECT label, marker, occurrence, side, pinned, enabled, created_at, meta_json
+                FROM anchor_configs
+                WHERE enabled = 1
+                ORDER BY label
+                """
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def insert_anchor(self, anchor: dict[str, Any]) -> None:
+        with contextlib.closing(self.connect()) as db:
+            db.execute(
+                """
+                INSERT OR IGNORE INTO anchors (
+                    node_id, label, token_count, prefix_hash, hash_algo, marker,
+                    occurrence, side, pinned, created_at, meta_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    anchor["node_id"],
+                    anchor["label"],
+                    int(anchor["token_count"]),
+                    anchor["prefix_hash"],
+                    anchor.get("hash_algo", HASH_ALGO),
+                    anchor.get("marker", ""),
+                    int(anchor.get("occurrence", 0)),
+                    anchor.get("side", "after"),
+                    1 if anchor.get("pinned") else 0,
+                    anchor.get("created_at", utc_now()),
+                    json.dumps(anchor.get("meta", {}), sort_keys=True),
+                ),
+            )
+            db.commit()
+
+    def lookup_materialized_anchor(self, *, label: str, tokens: list[int], touch: bool = False) -> dict[str, Any] | None:
+        if not tokens:
+            return None
+        digest = hash_tokens(tokens)
+        with contextlib.closing(self.connect()) as db:
+            row = db.execute(
+                """
+                SELECT n.*, a.label AS anchor_label, a.token_count AS anchor_token_count,
+                       a.prefix_hash AS anchor_prefix_hash, a.marker AS anchor_marker,
+                       a.occurrence AS anchor_occurrence, a.side AS anchor_side,
+                       a.pinned AS anchor_pinned
+                FROM anchors a
+                JOIN nodes n ON n.id = a.node_id
+                WHERE a.label = ?
+                  AND a.token_count = ?
+                  AND a.prefix_hash = ?
+                  AND n.boundary = 'anchor'
+                  AND n.token_count = a.token_count
+                  AND n.prefix_hash = a.prefix_hash
+                ORDER BY n.hits DESC, COALESCE(n.last_used, n.created_at) DESC, n.size_bytes ASC
+                LIMIT 1
+                """,
+                (label, len(tokens), digest),
+            ).fetchone()
+            if not row:
+                return None
+            node = dict(row)
+            if touch:
+                self.touch_node_in_db(db, node)
+                db.commit()
+            return node
+
+    def lookup_anchor(self, *, label: str, tokens: list[int], touch: bool = False) -> dict[str, Any] | None:
+        if not tokens:
+            return None
+        digest = hash_tokens(tokens)
+        with contextlib.closing(self.connect()) as db:
+            row = db.execute(
+                """
+                SELECT n.*, a.label AS anchor_label, a.token_count AS anchor_token_count,
+                       a.prefix_hash AS anchor_prefix_hash, a.marker AS anchor_marker,
+                       a.occurrence AS anchor_occurrence, a.side AS anchor_side,
+                       a.pinned AS anchor_pinned
+                FROM anchors a
+                JOIN nodes n ON n.id = a.node_id
+                WHERE a.label = ? AND a.token_count = ? AND a.prefix_hash = ?
+                ORDER BY n.hits DESC, COALESCE(n.last_used, n.created_at) DESC, n.size_bytes ASC
+                LIMIT 1
+                """,
+                (label, len(tokens), digest),
+            ).fetchone()
+            if not row:
+                return None
+            node = dict(row)
+            if touch:
+                self.touch_node_in_db(db, node)
+                db.commit()
             return node
 
     def parent_for(self, tokens: list[int], node_id: str) -> str | None:

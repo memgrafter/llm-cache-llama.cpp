@@ -357,7 +357,7 @@ class LMCacheProxyOnDemandTests(unittest.TestCase):
                 "tool_choice": "auto",
                 "stream": True,
             }
-            rendered = "<|im_start|>user\nhello<|im_end|>\n<|im_start|>assistant\n<think>\n"
+            rendered = "<|im_start|>system\nshared instructions<|im_end|>\n<|im_start|>user\nhello<|im_end|>\n<|im_start|>assistant\n<think>\n"
             rendered_tokens = list(rendered.encode("utf-8"))
             handler, body_bytes = self._make_handler(body, path="/v1/chat/completions")
             handler._forward = mock.Mock(return_value=lmcache.ForwardResult(
@@ -376,6 +376,9 @@ class LMCacheProxyOnDemandTests(unittest.TestCase):
             handler.min_free_bytes = 1
             handler.strict_prefix_restore = True
             handler.slot_id = 0
+            handler.anchor_configs = [lmcache.AnchorConfig("end-of-system-message", "<|im_end|>", 1, "after", True)]
+
+            anchor_tokens = list("<|im_start|>system\nshared instructions<|im_end|>".encode("utf-8"))
 
             def fake_call(method, path, body=None, server="localhost", port=8081, timeout=30):
                 if path == "/apply-template":
@@ -384,12 +387,20 @@ class LMCacheProxyOnDemandTests(unittest.TestCase):
                     return {"prompt": rendered}
                 if path == "/tokenize":
                     return {"tokens": list(body["content"].encode("utf-8"))}
+                if path == "/completion":
+                    self.assertEqual(body["prompt"], "<|im_start|>system\nshared instructions<|im_end|>")
+                    self.assertEqual(body["n_predict"], 0)
+                    return {"content": ""}
+                if path == "/slots/0?action=erase":
+                    return {"n_erased": 0}
                 if path == "/props":
                     return {"model_alias": "mock", "model_path": "/tmp/mock.gguf", "default_generation_settings": {"n_ctx": 4096}}
                 raise AssertionError((method, path, body))
 
             def fake_save(slot_id, bin_file, server="localhost", port=8081):
                 cache.absolute_bin_path(bin_file).write_bytes(b"saved-chat")
+                if bin_file.startswith("prefix_anchor_tmp_"):
+                    return {"n_saved": len(anchor_tokens), "filename": bin_file}
                 return {"n_saved": len(rendered_tokens) + 99, "filename": bin_file}
 
             with mock.patch.object(lmcache, "_call_llama", side_effect=fake_call), \
@@ -403,6 +414,151 @@ class LMCacheProxyOnDemandTests(unittest.TestCase):
             self.assertIsNotNone(node)
             self.assertEqual(node["token_count"], len(rendered_tokens))
             self.assertEqual(node["n_saved"], len(rendered_tokens) + 99)
+
+            anchor_match = cache.lookup_materialized_anchor(label="end-of-system-message", tokens=anchor_tokens)
+            self.assertIsNotNone(anchor_match)
+            self.assertEqual(anchor_match["boundary"], "anchor")
+            self.assertEqual(anchor_match["token_count"], len(anchor_tokens))
+
+    def test_prefix_cache_anchor_materializes_once_after_full_prefix_miss(self):
+        with tempfile.TemporaryDirectory() as cache_dir_str:
+            cache = prefix_cache.PrefixCache(pathlib.Path(cache_dir_str))
+            cache.init()
+            saved_prompt = "<|im_start|>system\nshared<|im_end|>\n<|im_start|>user\nold<|im_end|>\n"
+            incoming_prompt = "<|im_start|>system\nshared<|im_end|>\n<|im_start|>user\nnew<|im_end|>\n"
+            saved_tokens = list(saved_prompt.encode("utf-8"))
+            node_id, digest = prefix_cache.node_id_for(saved_tokens)
+            bin_file = cache.relative_node_bin(node_id)
+            cache.absolute_bin_path(bin_file).write_bytes(b"full")
+            cache.insert_node({
+                "id": node_id,
+                "parent_id": None,
+                "label": "full-node",
+                "boundary": "auto-response",
+                "token_count": len(saved_tokens),
+                "prefix_hash": digest,
+                "hash_algo": prefix_cache.HASH_ALGO,
+                "bin_file": bin_file,
+                "size_bytes": 4,
+                "n_saved": len(saved_tokens),
+                "created_at": prefix_cache.utc_now(),
+            })
+            anchor_text = "<|im_start|>system\nshared<|im_end|>"
+            anchor_tokens = list(anchor_text.encode("utf-8"))
+            cache.insert_anchor({
+                "node_id": node_id,
+                "label": "end-of-system-message",
+                "token_count": len(anchor_tokens),
+                "prefix_hash": prefix_cache.hash_tokens(anchor_tokens),
+                "marker": "<|im_end|>",
+                "occurrence": 1,
+                "side": "after",
+                "pinned": True,
+                "created_at": prefix_cache.utc_now(),
+            })
+
+            handler, body_bytes = self._make_handler({"messages": [{"role": "user", "content": "new"}]}, path="/v1/chat/completions")
+            handler._forward = mock.Mock(return_value=lmcache.ForwardResult(200, "text/event-stream", b""))
+            handler.prefix_cache_obj = cache
+            handler.cache_dir_obj = None
+            handler.auto_save_enabled = False
+            handler.prefix_cache_enabled = True
+            handler.strict_prefix_restore = True
+            handler.slot_id = 0
+            handler.anchor_configs = [lmcache.AnchorConfig("end-of-system-message", "<|im_end|>", 1, "after", True)]
+
+            def fake_call(method, path, body=None, server="localhost", port=8081, timeout=30):
+                if path == "/apply-template":
+                    return {"prompt": incoming_prompt}
+                if path == "/tokenize":
+                    return {"tokens": list(body["content"].encode("utf-8"))}
+                if path == "/completion":
+                    self.assertEqual(body["prompt"], anchor_text)
+                    return {"content": ""}
+                if path == "/slots/0?action=erase":
+                    return {"n_erased": len(saved_tokens)}
+                if path == "/props":
+                    return {"model_alias": "mock", "model_path": "/tmp/mock.gguf", "default_generation_settings": {"n_ctx": 4096}}
+                raise AssertionError((method, path, body))
+
+            def fake_save(slot_id, save_file, server="localhost", port=8081):
+                cache.absolute_bin_path(save_file).write_bytes(b"anchor")
+                return {"n_saved": len(anchor_tokens), "filename": save_file}
+
+            with mock.patch.object(lmcache, "_call_llama", side_effect=fake_call), \
+                 mock.patch.object(lmcache, "_restore_slot", return_value={"n_restored": len(saved_tokens)}) as restore, \
+                 mock.patch.object(lmcache, "_save_slot", side_effect=fake_save) as save:
+                handler._handle_request("POST")
+
+            restore.assert_not_called()
+            save.assert_called_once()
+            materialized = cache.lookup_materialized_anchor(label="end-of-system-message", tokens=anchor_tokens)
+            self.assertIsNotNone(materialized)
+            self.assertEqual(materialized["boundary"], "anchor")
+            self.assertEqual(materialized["token_count"], len(anchor_tokens))
+            handler._forward.assert_called_once_with("POST", "/v1/chat/completions", body_bytes)
+
+    def test_prefix_cache_restores_existing_materialized_anchor(self):
+        with tempfile.TemporaryDirectory() as cache_dir_str:
+            cache = prefix_cache.PrefixCache(pathlib.Path(cache_dir_str))
+            cache.init()
+            anchor_text = "<|im_start|>system\nshared<|im_end|>"
+            incoming_prompt = anchor_text + "\n<|im_start|>user\nnew<|im_end|>\n"
+            anchor_tokens = list(anchor_text.encode("utf-8"))
+            node_id, digest = prefix_cache.anchor_node_id_for("end-of-system-message", anchor_tokens)
+            bin_file = cache.relative_node_bin(node_id)
+            cache.absolute_bin_path(bin_file).write_bytes(b"anchor")
+            cache.insert_node({
+                "id": node_id,
+                "parent_id": None,
+                "label": "end-of-system-message",
+                "boundary": "anchor",
+                "token_count": len(anchor_tokens),
+                "prefix_hash": digest,
+                "hash_algo": prefix_cache.HASH_ALGO,
+                "bin_file": bin_file,
+                "size_bytes": 6,
+                "n_saved": len(anchor_tokens),
+                "created_at": prefix_cache.utc_now(),
+                "pinned": True,
+            })
+            cache.insert_anchor({
+                "node_id": node_id,
+                "label": "end-of-system-message",
+                "token_count": len(anchor_tokens),
+                "prefix_hash": digest,
+                "marker": "<|im_end|>",
+                "occurrence": 1,
+                "side": "after",
+                "pinned": True,
+                "created_at": prefix_cache.utc_now(),
+            })
+
+            handler, body_bytes = self._make_handler({"messages": [{"role": "user", "content": "new"}]}, path="/v1/chat/completions")
+            handler._forward = mock.Mock(return_value=lmcache.ForwardResult(200, "text/event-stream", b""))
+            handler.prefix_cache_obj = cache
+            handler.cache_dir_obj = None
+            handler.auto_save_enabled = False
+            handler.prefix_cache_enabled = True
+            handler.strict_prefix_restore = True
+            handler.slot_id = 0
+            handler.anchor_configs = [lmcache.AnchorConfig("end-of-system-message", "<|im_end|>", 1, "after", True)]
+
+            def fake_call(method, path, body=None, server="localhost", port=8081, timeout=30):
+                if path == "/apply-template":
+                    return {"prompt": incoming_prompt}
+                if path == "/tokenize":
+                    return {"tokens": list(body["content"].encode("utf-8"))}
+                raise AssertionError((method, path, body))
+
+            with mock.patch.object(lmcache, "_call_llama", side_effect=fake_call), \
+                 mock.patch.object(lmcache, "_restore_slot", return_value={"n_restored": len(anchor_tokens)}) as restore, \
+                 mock.patch.object(lmcache, "_save_slot") as save:
+                handler._handle_request("POST")
+
+            restore.assert_called_once_with(0, bin_file, "localhost", 8081)
+            save.assert_not_called()
+            handler._forward.assert_called_once_with("POST", "/v1/chat/completions", body_bytes)
 
     def test_prefix_cache_does_not_restore_exact_match_by_default(self):
         with tempfile.TemporaryDirectory() as cache_dir_str:
@@ -457,7 +613,7 @@ class LMCacheProxyOnDemandTests(unittest.TestCase):
             handler.min_save_tokens = 1
             handler.min_free_bytes = 999999999999
             handler.max_cache_bytes = 2 * lmcache.GIB
-            ctx = lmcache.RequestCacheContext("short", list(b"short"))
+            ctx = lmcache.RequestCacheContext("short", list(b"short"), [])
             result = lmcache.ForwardResult(
                 200,
                 "text/event-stream",

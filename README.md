@@ -36,6 +36,14 @@ curl -sS http://127.0.0.1:8081/health
 curl -sS http://127.0.0.1:8081/v1/models
 ```
 
+The first launch also initializes the prefix-cache SQLite DB and default chat anchor config:
+
+```text
+end-of-system-message: first <|im_end|>, side=after
+```
+
+On the first full-prefix miss for a new anchor value, the proxy automatically prefills that anchor once, saves an anchor-only KV node, and then forwards the original request unchanged. Later new chats with the same system anchor can restore that anchor-only node before processing the user-specific suffix.
+
 Clients, including pi, should use:
 
 ```text
@@ -50,6 +58,17 @@ kill "$(cat /tmp/lmcache-proxy-stack.pid)"
 ```
 
 When the supervisor/proxy stops, it also stops the llama.cpp backend.
+
+### Anchor creation
+
+Anchor config creation is automatic during DB init. Anchor KV creation is lazy: the first request whose rendered chat prompt contains a configured anchor will materialize an anchor-only node if no matching node exists yet. Watch for:
+
+```text
+prefix-cache materialized anchor node ...
+prefix-cache using newly materialized anchor node ...
+```
+
+Later matching requests should show a restore of that anchor node before the request is forwarded.
 
 ## Interface guide
 
@@ -103,6 +122,20 @@ Start without restoring a saved slot:
 RESTORE_SLOT_ON_START= ./run-lmcache-proxy-stack.sh
 ```
 
+Inspect anchor configs:
+
+```bash
+sqlite3 ~/.cache/llama.cpp-launch-scripts/slot-kv/trie/prefix-cache.sqlite \
+  'select label, marker, occurrence, side, pinned, enabled from anchor_configs;'
+```
+
+Inspect materialized anchor KV nodes:
+
+```bash
+sqlite3 ~/.cache/llama.cpp-launch-scripts/slot-kv/trie/prefix-cache.sqlite \
+  "select id, label, token_count, n_saved, size_bytes from nodes where boundary='anchor';"
+```
+
 PID files:
 
 ```text
@@ -153,7 +186,7 @@ Flags:
 | `--no-prefix-cache` | Disable trie-backed prefix-cache integration. |
 | `--allow-exact-prefix-restore` | Allow exact-length prefix restores; unsafe on the current llama.cpp build. |
 
-On each request, the proxy renders/tokenizes the prompt, restores the best strict-prefix trie node into slot 0, forwards the original request unchanged, streams the response, then saves the slot and records a trie node keyed by the incoming rendered prompt tokens. Static `slot_0_current.bin` remains separate.
+On each request, the proxy renders/tokenizes the prompt, restores the best strict-prefix trie node into slot 0, forwards the original request unchanged, streams the response, then saves the slot and records a trie node keyed by the incoming rendered prompt tokens. If full-prefix lookup misses, the first request for a configured anchor such as `end-of-system-message` materializes an anchor-only KV node; later requests restore that materialized anchor node. Static `slot_0_current.bin` remains separate.
 
 ### `run-qwen36-reap.sh` — backend only
 
