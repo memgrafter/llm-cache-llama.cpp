@@ -9,3 +9,5 @@ builds/
 logs/
 .cache/
 slot-kv/
+__pycache__/
+

@@ -1,0 +1,15 @@
+# TODO
+
+- Investigate llama.cpp restored-slot exact-prefix request crash.
+  - Normal slot save/restore/save roundtrip works and `cmp` is byte-identical.
+  - Nuance observed only when a restored slot is then used as cache for an incoming request with exactly the same prompt/token length.
+  - Repro used real service APIs with a test prefix bin:
+    - prefix token count: 3601
+    - save: `n_saved=3601`
+    - restore: `n_restored=3601`
+    - exact same `/completion` prompt after restore crashed backend.
+  - Crash path:
+    - `tools/server/server-context.cpp`: exact LCP match triggers `n_past--` at `[TAG_PROMPT_LOGITS]`.
+    - Then `common_context_seq_rm(ctx_tgt, slot.id, p0, -1)` is called with `p0=3600`.
+    - `common/common.cpp:1492` aborts because `llama_memory_seq_rm(..., p0=3600, p1=-1)` returns false.
+  - Treat as test nuance for now; do not block normal save/restore work.

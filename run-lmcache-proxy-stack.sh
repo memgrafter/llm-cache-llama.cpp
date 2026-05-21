@@ -1,0 +1,198 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Supervisor for the local LMCache proxy stack.
+# It starts llama.cpp as a private backend, starts the proxy as the public endpoint,
+# and stops llama.cpp whenever the proxy/supervisor stops.
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+cd "$SCRIPT_DIR"
+
+PUBLIC_HOST="${PUBLIC_HOST:-127.0.0.1}"
+PUBLIC_PORT="${PUBLIC_PORT:-8081}"
+BACKEND_HOST="${BACKEND_HOST:-127.0.0.1}"
+BACKEND_PORT="${BACKEND_PORT:-8082}"
+CACHE_DIR="${CACHE_DIR:-$HOME/.cache/llama.cpp-launch-scripts/slot-kv}"
+TOP_K="${TOP_K:-3}"
+RESTORE_SLOT_ON_START="${RESTORE_SLOT_ON_START:-slot_0_current.bin}"
+RESTORE_SLOT_ID="${RESTORE_SLOT_ID:-0}"
+STOP_EXISTING="${STOP_EXISTING:-1}"
+STARTUP_TIMEOUT="${STARTUP_TIMEOUT:-180}"
+
+# Model/backend defaults for this stack. Override with env vars as needed.
+export GGML_METAL_NO_RESIDENCY="${GGML_METAL_NO_RESIDENCY:-1}"
+export CTX="${CTX:-32768}"
+export NGL="${NGL:-999}"
+export BATCH="${BATCH:-64}"
+export UBATCH="${UBATCH:-16}"
+export CACHE_K="${CACHE_K:-turbo3}"
+export CACHE_V="${CACHE_V:-turbo3}"
+export MTP="${MTP:-0}"
+export HOST="$BACKEND_HOST"
+export PORT="$BACKEND_PORT"
+export ALIAS="${ALIAS:-qwen3.6-28b-reap-iq3xxs-turbo3-35k}"
+export SLOT_SAVE_PATH="$CACHE_DIR"
+export CACHE_RAM="${CACHE_RAM:-0}"
+
+LOG_DIR="${LOG_DIR:-$SCRIPT_DIR/logs}"
+mkdir -p "$LOG_DIR" "$CACHE_DIR"
+STAMP="${STAMP:-$(date +%Y%m%d-%H%M%S)}"
+BACKEND_LOG="${BACKEND_LOG:-$LOG_DIR/qwen36-backend-${STAMP}.log}"
+PROXY_LOG="${PROXY_LOG:-$LOG_DIR/lmcache-proxy-${STAMP}.log}"
+STACK_PID_FILE="${STACK_PID_FILE:-/tmp/lmcache-proxy-stack.pid}"
+PROXY_PID_FILE="${PROXY_PID_FILE:-/tmp/lmcache-proxy.pid}"
+BACKEND_PID_FILE="${BACKEND_PID_FILE:-/tmp/qwen36-llamacpp-backend.pid}"
+
+backend_pid=""
+proxy_pid=""
+
+echo $$ > "$STACK_PID_FILE"
+
+stop_pid() {
+  local pid="${1:-}"
+  local label="${2:-process}"
+  if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+    echo "Stopping $label PID $pid"
+    kill "$pid" 2>/dev/null || true
+  fi
+}
+
+cleanup() {
+  local status=$?
+  trap - EXIT INT TERM
+  stop_pid "$proxy_pid" "proxy"
+  stop_pid "$backend_pid" "llama.cpp backend"
+  if [[ -n "$proxy_pid" ]]; then wait "$proxy_pid" 2>/dev/null || true; fi
+  if [[ -n "$backend_pid" ]]; then wait "$backend_pid" 2>/dev/null || true; fi
+  [[ -f "$STACK_PID_FILE" ]] && [[ "$(cat "$STACK_PID_FILE" 2>/dev/null || true)" == "$$" ]] && rm -f "$STACK_PID_FILE"
+  [[ -n "$proxy_pid" ]] && [[ -f "$PROXY_PID_FILE" ]] && [[ "$(cat "$PROXY_PID_FILE" 2>/dev/null || true)" == "$proxy_pid" ]] && rm -f "$PROXY_PID_FILE"
+  [[ -n "$backend_pid" ]] && [[ -f "$BACKEND_PID_FILE" ]] && [[ "$(cat "$BACKEND_PID_FILE" 2>/dev/null || true)" == "$backend_pid" ]] && rm -f "$BACKEND_PID_FILE"
+  exit "$status"
+}
+trap cleanup EXIT INT TERM
+
+if [[ "$STOP_EXISTING" != "0" ]]; then
+  for pid_file in "$PROXY_PID_FILE" "$BACKEND_PID_FILE"; do
+    if [[ -f "$pid_file" ]]; then
+      pid="$(cat "$pid_file" 2>/dev/null || true)"
+      stop_pid "$pid" "$(basename "$pid_file")"
+    fi
+  done
+  for port in "$PUBLIC_PORT" "$BACKEND_PORT"; do
+    pids="$(lsof -tiTCP:"$port" -sTCP:LISTEN || true)"
+    if [[ -n "$pids" ]]; then
+      echo "Stopping existing listener(s) on $port: $pids"
+      # shellcheck disable=SC2086
+      kill $pids 2>/dev/null || true
+    fi
+  done
+  for _ in $(seq 1 30); do
+    if ! lsof -tiTCP:"$PUBLIC_PORT" -sTCP:LISTEN >/dev/null 2>&1 && \
+       ! lsof -tiTCP:"$BACKEND_PORT" -sTCP:LISTEN >/dev/null 2>&1; then
+      break
+    fi
+    sleep 1
+  done
+fi
+
+if lsof -tiTCP:"$PUBLIC_PORT" -sTCP:LISTEN >/dev/null 2>&1 || \
+   lsof -tiTCP:"$BACKEND_PORT" -sTCP:LISTEN >/dev/null 2>&1; then
+  echo "Public/backend port still busy; set STOP_EXISTING=1 or clear the listener manually." >&2
+  lsof -nP -iTCP:"$PUBLIC_PORT" -sTCP:LISTEN >&2 || true
+  lsof -nP -iTCP:"$BACKEND_PORT" -sTCP:LISTEN >&2 || true
+  exit 1
+fi
+
+echo "Starting llama.cpp backend on $BACKEND_HOST:$BACKEND_PORT"
+echo "Backend log: $BACKEND_LOG"
+./run-qwen36-reap.sh --serve > "$BACKEND_LOG" 2>&1 &
+backend_pid=$!
+echo "$backend_pid" > "$BACKEND_PID_FILE"
+
+for i in $(seq 1 "$STARTUP_TIMEOUT"); do
+  if curl -sS --max-time 2 "http://$BACKEND_HOST:$BACKEND_PORT/health" 2>/dev/null | grep -q '"status":"ok"'; then
+    echo "Backend health OK after ${i}s"
+    break
+  fi
+  if ! kill -0 "$backend_pid" 2>/dev/null; then
+    echo "llama.cpp backend exited during startup" >&2
+    tail -n 80 "$BACKEND_LOG" >&2 || true
+    exit 1
+  fi
+  if [[ "$i" == "$STARTUP_TIMEOUT" ]]; then
+    echo "Timed out waiting for backend health" >&2
+    tail -n 80 "$BACKEND_LOG" >&2 || true
+    exit 1
+  fi
+  sleep 1
+done
+
+if [[ -n "$RESTORE_SLOT_ON_START" ]]; then
+  echo "Restoring slot $RESTORE_SLOT_ID from $RESTORE_SLOT_ON_START"
+  curl -sS --max-time 180 \
+    -X POST "http://$BACKEND_HOST:$BACKEND_PORT/slots/$RESTORE_SLOT_ID?action=restore" \
+    -H 'Content-Type: application/json' \
+    -d "{\"filename\":\"$RESTORE_SLOT_ON_START\"}"
+  echo
+fi
+
+echo "Starting LMCache proxy on $PUBLIC_HOST:$PUBLIC_PORT -> $BACKEND_HOST:$BACKEND_PORT"
+echo "Proxy log: $PROXY_LOG"
+python3 lmcache-proxy-on-demand.py \
+  --host "$PUBLIC_HOST" \
+  --port "$PUBLIC_PORT" \
+  --server "$BACKEND_HOST" \
+  --llama-port "$BACKEND_PORT" \
+  --cache-dir "$CACHE_DIR" \
+  --top-k "$TOP_K" \
+  > "$PROXY_LOG" 2>&1 &
+proxy_pid=$!
+echo "$proxy_pid" > "$PROXY_PID_FILE"
+
+for i in $(seq 1 30); do
+  if lsof -tiTCP:"$PUBLIC_PORT" -sTCP:LISTEN >/dev/null 2>&1; then
+    echo "Proxy listening after ${i}s"
+    break
+  fi
+  if ! kill -0 "$proxy_pid" 2>/dev/null; then
+    echo "LMCache proxy exited during startup" >&2
+    cat "$PROXY_LOG" >&2 || true
+    exit 1
+  fi
+  if [[ "$i" == "30" ]]; then
+    echo "Timed out waiting for proxy listener" >&2
+    cat "$PROXY_LOG" >&2 || true
+    exit 1
+  fi
+  sleep 1
+done
+
+cat <<EOF
+
+Stack ready.
+Public endpoint: http://$PUBLIC_HOST:$PUBLIC_PORT/v1
+Model alias:     $ALIAS
+Backend:         http://$BACKEND_HOST:$BACKEND_PORT
+Stack PID:       $$
+Proxy PID:       $proxy_pid
+Backend PID:     $backend_pid
+
+Stop with:
+  kill $(cat "$STACK_PID_FILE")
+
+EOF
+
+while true; do
+  if ! kill -0 "$proxy_pid" 2>/dev/null; then
+    echo "LMCache proxy stopped; stopping llama.cpp backend."
+    wait "$proxy_pid" 2>/dev/null || true
+    exit 0
+  fi
+  if ! kill -0 "$backend_pid" 2>/dev/null; then
+    echo "llama.cpp backend stopped; stopping LMCache proxy." >&2
+    stop_pid "$proxy_pid" "proxy"
+    wait "$backend_pid" 2>/dev/null || true
+    exit 1
+  fi
+  sleep 1
+done

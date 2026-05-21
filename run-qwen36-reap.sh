@@ -72,11 +72,12 @@ CACHE_V="${CACHE_V:-turbo3}"
 # Server knobs.
 HOST="${HOST:-127.0.0.1}"
 PORT="${PORT:-8081}"
-ALIAS="${ALIAS:-qwen3.6-28b-reap-iq3xxs-llamacpp}"
+ALIAS="${ALIAS:-qwen3.6-28b-reap-iq3xxs-turbo3-35k}"
 PARALLEL="${PARALLEL:-1}"
 MTP="${MTP:-0}"
 SLOT_SAVE_PATH="${SLOT_SAVE_PATH:-$HOME/.cache/llama.cpp-launch-scripts/slot-kv}"
 CACHE_REUSE="${CACHE_REUSE:-256}"
+CACHE_RAM="${CACHE_RAM:-0}"
 
 # Runtime behavior.
 FLASH_ATTN="${FLASH_ATTN:-auto}"
@@ -146,6 +147,10 @@ if [[ "$SERVE" == "1" ]]; then
 
   if [[ -n "$SLOT_SAVE_PATH" ]]; then
     args+=(--slot-save-path "$SLOT_SAVE_PATH")
+  fi
+
+  if [[ -n "$CACHE_RAM" ]]; then
+    args+=(--cache-ram "$CACHE_RAM")
   fi
 
   if [[ "$CACHE_REUSE" != "0" ]]; then
@@ -226,7 +231,7 @@ echo "CTX=$CTX NPRED=$NPRED NGL=$NGL THREADS=$THREADS BATCH=$BATCH UBATCH=$UBATC
 echo "CACHE_K=$CACHE_K CACHE_V=$CACHE_V FLASH_ATTN=$FLASH_ATTN KV_OFFLOAD=$KV_OFFLOAD MLOCK=$MLock"
 echo "GGML_METAL_NO_RESIDENCY=$GGML_METAL_NO_RESIDENCY iogpu.wired_limit_mb=$(sysctl -n iogpu.wired_limit_mb 2>/dev/null || echo unknown)"
 if [[ "$SERVE" == "1" ]]; then
-  echo "SERVE=1 URL=http://$HOST:$PORT/v1 MODEL_ALIAS=$ALIAS PARALLEL=$PARALLEL MTP=$MTP SLOT_SAVE_PATH=${SLOT_SAVE_PATH:-<disabled>} CACHE_REUSE=$CACHE_REUSE"
+  echo "SERVE=1 URL=http://$HOST:$PORT/v1 MODEL_ALIAS=$ALIAS PARALLEL=$PARALLEL MTP=$MTP SLOT_SAVE_PATH=${SLOT_SAVE_PATH:-<disabled>} CACHE_RAM=${CACHE_RAM:-<default>} CACHE_REUSE=$CACHE_REUSE"
 else
   echo "CONVERSATION=$CONVERSATION SINGLE_TURN=$SINGLE_TURN SIMPLE_IO=$SIMPLE_IO DISPLAY_PROMPT=$DISPLAY_PROMPT PROMPT_FILE=${PROMPT_FILE:-<none>}"
 fi

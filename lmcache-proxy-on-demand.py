@@ -51,12 +51,12 @@ class KVCache:
         return hashlib.sha256(prefix.encode("utf-8")).hexdigest()[:32]
 
     def _list_cached(self, prefix_hash: str) -> list[str]:
-        """Return cached KV filenames matching this prefix hash (most recent first)."""
+        """Return cached KV .bin filenames matching this prefix hash (most recent first)."""
         p = self.cache_dir / prefix_hash
         if not p.is_dir():
             return []
         entries = sorted(p.iterdir(), key=lambda f: f.stat().st_mtime, reverse=True)
-        return [str(e) for e in entries[:self.top_k]]
+        return [str(e) for e in entries if str(e).endswith('.bin')][:self.top_k]
 
     def find_match(self, prompt: str) -> list[str]:
         """Return up to top_k cached KV .bin files whose prefix matches the prompt."""
@@ -177,9 +177,7 @@ class LMCacheHandler(BaseHTTPRequestHandler):
         req.add_header("Content-Type", "application/json")
         try:
             with urllib.request.urlopen(req, timeout=120) as resp:
-                self.send_response(resp.status)
-                self._write_headers(resp.headers)
-                self._write_body(resp.read())
+                self._write_response(resp)
         except urllib.error.HTTPError as e:
             log.warning("llama server error: %s", e)
             self._send_error(502, f"llama server error: {e}")
@@ -224,24 +222,29 @@ class LMCacheHandler(BaseHTTPRequestHandler):
             if not kv_files:
                 continue
 
-            # Load metadata and check compatibility
-            meta = self.cache_dir_obj.load_metadata(kv_files[0])
-            if not meta or not self._check_compatibility(meta):
-                log.debug("KV incompatible, skipping: %s", kv_files[0])
-                continue
+            # Load metadata and check compatibility for each candidate
+            restored = False
+            for kv_path in kv_files:
+                meta = self.cache_dir_obj.load_metadata(kv_path)
+                if not meta or not self._check_compatibility(meta):
+                    log.debug("KV incompatible, skipping: %s", kv_path)
+                    continue
 
-            # Find an idle slot
-            slot_id = self._get_available_slot()
-            if slot_id is None:
+                # Find an idle slot
+                slot_id = self._get_available_slot()
+                if slot_id is None:
+                    break
+
+                # Restore KV into that slot
+                result = _restore_slot(slot_id, kv_path,
+                                       self.llama_server, self.llama_port)
+                if result:
+                    log.info("restored KV into slot %d", slot_id)
+                    kv_restored = True
+                    restored = True
+                    break
+            if restored:
                 break
-
-            # Restore KV into that slot
-            result = _restore_slot(slot_id, kv_files[0],
-                                   self.llama_server, self.llama_port)
-            if result:
-                log.info("restored KV into slot %d", slot_id)
-                kv_restored = True
-                break  # only need one match per request
 
         if kv_restored:
             log.info("KV restored before forwarding request")
@@ -287,13 +290,15 @@ class LMCacheHandler(BaseHTTPRequestHandler):
         self.send_response(code)
         self._write_body(message)
 
-    def _write_headers(self, headers):
-        """Write response headers from urllib's response."""
-        for key in headers.keys():
-            val = headers.get(key)
+    def _write_response(self, resp):
+        """Write response status, headers, and body from urllib's response."""
+        self.send_response(resp.status, resp.reason)
+        for key in resp.headers.keys():
+            val = resp.headers.get(key)
             if val is not None:
-                self.headers.add_header(key, val)
-        self.send_response(int(headers.status))
+                self.send_header(key, val)
+        self.end_headers()
+        self.wfile.write(resp.read())
 
     def _write_body(self, body: bytes):
         """Write response body."""
@@ -332,7 +337,7 @@ def main():
 
     try:
         server = HTTPServer((args.host, args.port), LMCacheHandler)
-        log.info("proxy ready — clients should point to port %d", args.proxy_port)
+        log.info("proxy ready — clients should point to port %d", args.port)
         server.serve_forever()
     except KeyboardInterrupt:
         log.info("shutting down")
