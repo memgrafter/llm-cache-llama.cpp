@@ -28,7 +28,7 @@ There are two separate slot-KV paths:
 3. Restore the matching node into slot `0`.
 4. Forward the original request unchanged.
 5. Stream the backend response through to the client.
-6. After the response completes, save slot `0` into a new trie node.
+6. After the response completes, save slot `0` and create a trie node keyed by the incoming rendered prompt tokens.
 7. Prune to the configured size limit.
 
 Important: the proxy forwards the original request unchanged. llama.cpp still owns prompt reuse semantics after restore.
@@ -75,13 +75,7 @@ ALLOW_EXACT_PREFIX_RESTORE=1 ./run-lmcache-proxy-stack.sh
 
 Streaming is supported and is the main autosave path.
 
-For llama.cpp `/completion` streaming responses, the final saved slot usually contains:
-
-```text
-prompt tokens + generated tokens except the last generated token
-```
-
-That is expected: the last sampled token has been emitted, but its KV may not be present until it is evaluated as input for the next token. The proxy therefore saves to a temp filename first, reads `n_saved`, reconstructs the exact saved token prefix from streamed token IDs, then renames the bin to the final node filename.
+Automatic nodes are keyed by the exact incoming rendered prompt tokens, not by trying to reconstruct generated output. The saved slot file may contain additional generated tokens. That is safe: on a later longer chat request, llama.cpp computes the true LCP against the restored slot and reuses any matching generated tokens too. This avoids corrupt metadata when `/v1/chat/completions` streams omit or transform reasoning/content text.
 
 ## Storage behavior
 
@@ -104,34 +98,11 @@ X-LMCache-Bypass: 1
 
 This prevents management operations like `prefix_cache.py add` from recursively triggering proxy autosave when pointed at the public proxy URL.
 
-## Verified live behavior
+## Current live note
 
-Live stack was restarted with:
+The first automatic implementation validated `/completion`, but real usage is `/v1/chat/completions`. Chat autosave was adjusted to key nodes by incoming rendered prompt tokens because reconstructing saved slot tokens from OpenAI chat stream deltas is not reliable.
 
-```bash
-MIN_SAVE_TOKENS=1 ./run-lmcache-proxy-stack.sh
-```
-
-A streaming `/completion` request autosaved a node:
-
-```text
-prefix-cache autosaved node 41-... (41 tokens, 63.1 MiB)
-```
-
-A later longer streaming request restored that node before forwarding:
-
-```text
-prefix-cache restored node 41-... (41 tokens)
-```
-
-With normal `cache_prompt` behavior, llama.cpp reported reuse on a subsequent request:
-
-```text
-cache_n = 53
-prompt_n = 10
-```
-
-If the client sends `cache_prompt: false`, llama.cpp can still accept the restore but reports `cache_n = 0`; the proxy intentionally does not rewrite this client setting.
+A live `/v1/chat/completions` streaming autosave was verified with `MIN_SAVE_TOKENS=1`: the proxy created a DB node keyed to the rendered prompt and saved a slot bin where `n_saved >= token_count`. The temporary live-test nodes were deleted afterward. A gated live regression test exists in `tests/test_lmcache_proxy_on_demand.py` behind `RUN_LIVE_PROXY_CHAT_CACHE_TESTS=1`.
 
 ## Tests
 

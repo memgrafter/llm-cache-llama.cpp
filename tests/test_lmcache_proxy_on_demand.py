@@ -2,11 +2,14 @@ import hashlib
 import importlib.util
 import io
 import json
+import os
 import pathlib
 import shutil
 import sys
 import tempfile
+import time
 import unittest
+import urllib.request
 from unittest import mock
 
 import prefix_cache
@@ -336,12 +339,70 @@ class LMCacheProxyOnDemandTests(unittest.TestCase):
             handler._forward.assert_called_once_with("POST", "/completion", body_bytes)
             save.assert_called_once()
 
-            saved_tokens = list((request_prompt + generated).encode("utf-8"))
+            saved_tokens = list(request_prompt.encode("utf-8"))
             saved_id, _ = prefix_cache.node_id_for(saved_tokens)
             saved_node = cache.get_node(saved_id)
             self.assertIsNotNone(saved_node)
             self.assertEqual(saved_node["parent_id"], parent_id)
             self.assertEqual(saved_node["token_count"], len(saved_tokens))
+            self.assertGreater(saved_node["n_saved"], saved_node["token_count"])
+
+    def test_chat_completions_autosave_keys_known_rendered_prompt(self):
+        with tempfile.TemporaryDirectory() as cache_dir_str:
+            cache = prefix_cache.PrefixCache(pathlib.Path(cache_dir_str))
+            cache.init()
+            body = {
+                "messages": [{"role": "user", "content": "hello"}],
+                "tools": [{"type": "function", "function": {"name": "noop", "parameters": {"type": "object"}}}],
+                "tool_choice": "auto",
+                "stream": True,
+            }
+            rendered = "<|im_start|>user\nhello<|im_end|>\n<|im_start|>assistant\n<think>\n"
+            rendered_tokens = list(rendered.encode("utf-8"))
+            handler, body_bytes = self._make_handler(body, path="/v1/chat/completions")
+            handler._forward = mock.Mock(return_value=lmcache.ForwardResult(
+                200,
+                "text/event-stream",
+                b'data: {"choices":[{"delta":{"reasoning_content":"hidden"}}]}\n\n'
+                b'data: {"choices":[{"delta":{"content":"shown"}}]}\n\n'
+                b'data: [DONE]\n\n',
+            ))
+            handler.prefix_cache_obj = cache
+            handler.cache_dir_obj = None
+            handler.auto_save_enabled = True
+            handler.prefix_cache_enabled = True
+            handler.min_save_tokens = 1
+            handler.max_cache_bytes = 2 * lmcache.GIB
+            handler.min_free_bytes = 1
+            handler.strict_prefix_restore = True
+            handler.slot_id = 0
+
+            def fake_call(method, path, body=None, server="localhost", port=8081, timeout=30):
+                if path == "/apply-template":
+                    self.assertIn("tools", body)
+                    self.assertIn("tool_choice", body)
+                    return {"prompt": rendered}
+                if path == "/tokenize":
+                    return {"tokens": list(body["content"].encode("utf-8"))}
+                if path == "/props":
+                    return {"model_alias": "mock", "model_path": "/tmp/mock.gguf", "default_generation_settings": {"n_ctx": 4096}}
+                raise AssertionError((method, path, body))
+
+            def fake_save(slot_id, bin_file, server="localhost", port=8081):
+                cache.absolute_bin_path(bin_file).write_bytes(b"saved-chat")
+                return {"n_saved": len(rendered_tokens) + 99, "filename": bin_file}
+
+            with mock.patch.object(lmcache, "_call_llama", side_effect=fake_call), \
+                 mock.patch.object(lmcache, "_restore_slot", return_value=None), \
+                 mock.patch.object(lmcache, "_save_slot", side_effect=fake_save):
+                handler._handle_request("POST")
+
+            handler._forward.assert_called_once_with("POST", "/v1/chat/completions", body_bytes)
+            node_id, _ = prefix_cache.node_id_for(rendered_tokens)
+            node = cache.get_node(node_id)
+            self.assertIsNotNone(node)
+            self.assertEqual(node["token_count"], len(rendered_tokens))
+            self.assertEqual(node["n_saved"], len(rendered_tokens) + 99)
 
     def test_prefix_cache_does_not_restore_exact_match_by_default(self):
         with tempfile.TemporaryDirectory() as cache_dir_str:
@@ -416,6 +477,84 @@ class LMCacheProxyOnDemandTests(unittest.TestCase):
 
             save.assert_not_called()
             self.assertEqual(cache.list_nodes(), [])
+
+
+@unittest.skipUnless(
+    os.environ.get("RUN_LIVE_PROXY_CHAT_CACHE_TESTS") == "1",
+    "set RUN_LIVE_PROXY_CHAT_CACHE_TESTS=1 to run live proxy chat-cache test",
+)
+class LMCacheProxyLiveChatTests(unittest.TestCase):
+    def setUp(self):
+        self.base_url = os.environ.get("PREFIX_CACHE_LIVE_BASE_URL", "http://127.0.0.1:8081")
+        self.cache_dir = pathlib.Path(
+            os.environ.get("PREFIX_CACHE_LIVE_CACHE_DIR", str(prefix_cache.DEFAULT_CACHE_DIR))
+        ).expanduser()
+        try:
+            with urllib.request.urlopen(self.base_url + "/health", timeout=5) as resp:
+                data = json.loads(resp.read().decode())
+        except Exception as e:
+            raise unittest.SkipTest(f"live proxy unavailable: {e}")
+        if data.get("status") != "ok":
+            raise unittest.SkipTest(f"live proxy unhealthy: {data!r}")
+        self.created_node_ids = []
+
+    def tearDown(self):
+        cache = prefix_cache.PrefixCache(self.cache_dir)
+        for node_id in reversed(self.created_node_ids):
+            node = cache.get_node(node_id)
+            if not node:
+                continue
+            try:
+                cache.absolute_bin_path(node["bin_file"]).unlink()
+            except FileNotFoundError:
+                pass
+            db = cache.connect()
+            try:
+                db.execute("DELETE FROM nodes WHERE id = ?", (node_id,))
+                db.commit()
+            finally:
+                db.close()
+
+    def post_json(self, path, body, *, timeout=120):
+        req = urllib.request.Request(
+            self.base_url + path,
+            data=json.dumps(body).encode(),
+            headers={"Content-Type": "application/json", "X-LMCache-Bypass": "1"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read().decode())
+
+    def test_live_chat_completions_autosaves_rendered_prompt_node(self):
+        marker = f"LIVE-CHAT-AUTOCACHE-{time.time_ns()}"
+        body = {
+            "messages": [{"role": "user", "content": marker + " " + ("cacheword " * 320)}],
+            "stream": True,
+            "max_tokens": 2,
+            "temperature": 0.0,
+        }
+        rendered = self.post_json("/apply-template", {"messages": body["messages"]})["prompt"]
+        tokens = self.post_json("/tokenize", {"content": rendered})["tokens"]
+        node_id, _ = prefix_cache.node_id_for([int(t) for t in tokens])
+        self.created_node_ids.append(node_id)
+
+        req = urllib.request.Request(
+            self.base_url + "/v1/chat/completions",
+            data=json.dumps(body).encode(),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=300) as resp:
+            for _ in resp:
+                pass
+
+        # Autosave runs after stream completion in the same handler; allow filesystem settle.
+        time.sleep(0.5)
+        node = prefix_cache.PrefixCache(self.cache_dir).get_node(node_id)
+        self.assertIsNotNone(node)
+        self.assertEqual(node["token_count"], len(tokens))
+        self.assertGreaterEqual(node["n_saved"], node["token_count"])
+        self.assertTrue((self.cache_dir / node["bin_file"]).exists())
 
 
 if __name__ == "__main__":

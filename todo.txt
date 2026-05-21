@@ -13,3 +13,23 @@
     - Then `common_context_seq_rm(ctx_tgt, slot.id, p0, -1)` is called with `p0=3600`.
     - `common/common.cpp:1492` aborts because `llama_memory_seq_rm(..., p0=3600, p1=-1)` returns false.
   - Treat as test nuance for now; do not block normal save/restore work.
+
+- Improve prefix-cache save policy for agentic coding workloads.
+  - Current autosave checkpoints full rendered chat prompts, which usually include a unique first user message.
+  - This can create many one-off root/near-root cache nodes with low reuse.
+  - Add explicit stable-base checkpoints for shared context: system prompt, developer prompt, tool schemas, project context, AGENTS/context, and repo map.
+  - Consider pinning or strongly protecting these stable-base nodes from pruning.
+
+- Make prefix-cache lookup/tree policy match actual work branching.
+  - Current selection uses longest matching token-prefix hash across global cached lengths.
+  - A real trie traversal may reduce irrelevant global length checks, but root fanout will be huge unless stable-base checkpoints exist.
+  - Consider hybrid lookup: trie traversal from stable-base nodes, with hash-index fallback for repair/debug.
+
+- Improve cache pruning beyond simple leaf/recency scoring.
+  - Current pruning is mostly leaf-first with wall-clock recency, hit count, and size.
+  - Agentic coding reuse is often “work recency”: current head, recent rewind point, branch point, or summary insertion point.
+  - Add metadata/scoring for active branch, branch depth, descendant count, distance from current work head, pinned stable context, hits, last_used, and size.
+
+- Add optional pi/workflow metadata to cache requests.
+  - Proposed headers or request metadata: session id, tree id, branch id, node id, current-head marker, and cache-boundary type.
+  - Use this to distinguish stable shared prefixes, current conversation head, branch checkpoints, abandoned side branches, and summary replacement points.

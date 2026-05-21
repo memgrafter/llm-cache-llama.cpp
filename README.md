@@ -83,7 +83,7 @@ Useful environment overrides:
 | `RESTORE_SLOT_ON_START` | `slot_0_current.bin` | Static slot KV file to restore into llama.cpp before the proxy starts; set empty to skip. |
 | `RESTORE_SLOT_ID` | `0` | Slot id restored at startup. |
 | `TOP_K` | `3` | Legacy KV candidates the proxy may try per prompt. |
-| `MIN_SAVE_TOKENS` | `256` | Minimum saved-token count before automatic prefix-cache autosave. |
+| `MIN_SAVE_TOKENS` | `256` | Minimum rendered-prompt token count before automatic prefix-cache autosave. |
 | `PREFIX_CACHE_MAX_BYTES` | `2GiB` | Trie-backed prefix-cache size limit; leaf nodes are pruned to stay under it. |
 | `PREFIX_CACHE_MIN_FREE_BYTES` | `512MiB` | Minimum filesystem free space required before autosave; the proxy prunes or skips gracefully below it. |
 | `NO_AUTO_SAVE` | `0` | Set `1` to restore prefixes but skip automatic saves. |
@@ -146,14 +146,14 @@ Flags:
 | `--llama-port` | llama.cpp backend port. |
 | `--cache-dir` | Disk KV cache directory. |
 | `--top-k` | Legacy cache fallback candidate count. |
-| `--min-save-tokens` | Minimum saved-token count before automatic prefix-cache autosave. |
+| `--min-save-tokens` | Minimum rendered-prompt token count before automatic prefix-cache autosave. |
 | `--prefix-cache-max-bytes` | Trie-backed prefix-cache size limit. |
 | `--prefix-cache-min-free-bytes` | Minimum filesystem free space before autosave. |
 | `--no-auto-save` | Restore matching prefixes but do not save completed requests. |
 | `--no-prefix-cache` | Disable trie-backed prefix-cache integration. |
 | `--allow-exact-prefix-restore` | Allow exact-length prefix restores; unsafe on the current llama.cpp build. |
 
-On each request, the proxy renders/tokenizes the prompt, restores the best strict-prefix trie node into slot 0, forwards the original request unchanged, streams the response, then autosaves the completed slot into the trie. Static `slot_0_current.bin` remains separate.
+On each request, the proxy renders/tokenizes the prompt, restores the best strict-prefix trie node into slot 0, forwards the original request unchanged, streams the response, then saves the slot and records a trie node keyed by the incoming rendered prompt tokens. Static `slot_0_current.bin` remains separate.
 
 ### `run-qwen36-reap.sh` — backend only
 

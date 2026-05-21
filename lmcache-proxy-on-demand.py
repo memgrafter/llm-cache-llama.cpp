@@ -140,72 +140,6 @@ def _get_server_model_info(server: str, port: int) -> dict | None:
         return None
 
 
-def _extract_generated(content_type: str, body: bytes, request_body: dict) -> tuple[str, list[int]]:
-    """Extract generated text and token ids from llama.cpp JSON or SSE responses."""
-    if not body:
-        return "", []
-    text = body.decode("utf-8", errors="replace")
-    generated: list[str] = []
-    generated_tokens: list[int] = []
-
-    if "text/event-stream" in content_type or request_body.get("stream") is True:
-        for line in text.splitlines():
-            line = line.strip()
-            if not line.startswith("data:"):
-                continue
-            payload = line[5:].strip()
-            if not payload or payload == "[DONE]":
-                continue
-            try:
-                obj = json.loads(payload)
-            except json.JSONDecodeError:
-                continue
-            val = obj.get("content")
-            if isinstance(val, str):
-                generated.append(val)
-            toks = obj.get("tokens")
-            if isinstance(toks, list):
-                generated_tokens.extend(int(t) for t in toks)
-            for choice in obj.get("choices", []):
-                delta = choice.get("delta") or {}
-                if isinstance(delta, dict):
-                    for key in ("reasoning_content", "content", "text"):
-                        val = delta.get(key)
-                        if isinstance(val, str):
-                            generated.append(val)
-                val = choice.get("text")
-                if isinstance(val, str):
-                    generated.append(val)
-        return "".join(generated), generated_tokens
-
-    try:
-        obj = json.loads(text)
-    except json.JSONDecodeError:
-        return "", []
-
-    val = obj.get("content")
-    if isinstance(val, str):
-        generated.append(val)
-
-    for choice in obj.get("choices", []):
-        val = choice.get("text")
-        if isinstance(val, str):
-            generated.append(val)
-        msg = choice.get("message") or {}
-        if isinstance(msg, dict):
-            for key in ("reasoning_content", "content"):
-                val = msg.get(key)
-                if isinstance(val, str):
-                    generated.append(val)
-
-    return "".join(generated), generated_tokens
-
-
-def _extract_generated_text(content_type: str, body: bytes, request_body: dict) -> str:
-    """Backward-compatible helper for tests/callers that only need text."""
-    return _extract_generated(content_type, body, request_body)[0]
-
-
 class LMCacheHandler(BaseHTTPRequestHandler):
     """HTTP proxy handler that restores and saves prefix-cache KV on demand."""
 
@@ -319,10 +253,15 @@ class LMCacheHandler(BaseHTTPRequestHandler):
             return prompt if isinstance(prompt, str) else json.dumps(prompt, separators=(",", ":"))
 
         if "messages" in body and (path.startswith("/v1/chat/completions") or path.startswith("/chat/completions")):
+            # Send the full chat body, not just messages. llama.cpp's chat
+            # template can include tools, tool_choice, parallel_tool_calls,
+            # chat_template_kwargs, add_generation_prompt, reasoning_format,
+            # and other template-affecting fields. Omitting them creates cache
+            # keys that do not match the actual slot prompt.
             res = _call_llama(
                 "POST",
                 "/apply-template",
-                {"messages": body.get("messages", [])},
+                dict(body),
                 self.llama_server,
                 self.llama_port,
                 timeout=120,
@@ -410,7 +349,14 @@ class LMCacheHandler(BaseHTTPRequestHandler):
         if result.status < 200 or result.status >= 300:
             return
 
-        generated_text, generated_token_ids = _extract_generated(result.content_type, result.body, request_body)
+        # Key automatic nodes by the exact incoming prompt tokens we can prove.
+        # The saved slot may contain additional generated tokens; that is safe.
+        # On a later longer chat request, llama.cpp will compute the true LCP
+        # against the restored slot and reuse any matching generated tokens too.
+        tokens = ctx.prompt_tokens
+        if len(tokens) < self.min_save_tokens:
+            log.debug("prefix-cache autosave skipped: %d prompt tokens < min %d", len(tokens), self.min_save_tokens)
+            return
 
         cache = self.prefix_cache_obj
         cache.init()
@@ -423,8 +369,8 @@ class LMCacheHandler(BaseHTTPRequestHandler):
         if not isinstance(save, dict):
             return
         n_saved = int(save.get("n_saved", -1))
-        if n_saved < self.min_save_tokens:
-            log.debug("prefix-cache autosave skipped: %d saved tokens < min %d", n_saved, self.min_save_tokens)
+        if n_saved < len(tokens):
+            log.warning("prefix-cache autosave skipped: n_saved=%d prompt_tokens=%d", n_saved, len(tokens))
             try:
                 tmp_path.unlink()
             except FileNotFoundError:
@@ -432,22 +378,6 @@ class LMCacheHandler(BaseHTTPRequestHandler):
             return
         if not tmp_path.exists():
             log.warning("prefix-cache autosave skipped: save succeeded but bin is missing: %s", tmp_path)
-            return
-
-        if generated_token_ids and n_saved >= len(ctx.prompt_tokens):
-            n_generated_saved = n_saved - len(ctx.prompt_tokens)
-            tokens = ctx.prompt_tokens + generated_token_ids[:n_generated_saved]
-        else:
-            # Fallback for non-stream JSON responses that do not include token ids.
-            cache_text = ctx.prompt_text + generated_text
-            tokens = self._tokenize(cache_text) or []
-
-        if len(tokens) != n_saved:
-            log.warning("prefix-cache autosave skipped: n_saved=%d reconstructed=%d", n_saved, len(tokens))
-            try:
-                tmp_path.unlink()
-            except FileNotFoundError:
-                pass
             return
 
         node_id, digest = prefix_cache.node_id_for(tokens)
