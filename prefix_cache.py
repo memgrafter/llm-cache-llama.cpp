@@ -90,6 +90,34 @@ def anchor_node_id_for(label: str, tokens: list[int]) -> tuple[str, str]:
     return f"anchor-{label_hash}-{base_id}", digest
 
 
+def read_slot_bin_tokens(path: pathlib.Path) -> list[int]:
+    """Read token IDs from a llama.cpp slot-save .bin file.
+
+    Current llama.cpp slot files begin with:
+      - magic: 4 bytes, b"qsgg"
+      - version: uint32 little-endian
+      - n_saved: uint32 little-endian
+      - n_saved token IDs as uint32 little-endian
+
+    The KV tensors follow the token table and are intentionally ignored here.
+    """
+    with path.open("rb") as f:
+        header = f.read(12)
+        if len(header) != 12:
+            raise ValueError(f"slot bin too short: {path}")
+        magic, version, n_saved = struct.unpack("<4sII", header)
+        if magic != b"qsgg":
+            raise ValueError(f"unsupported slot bin magic {magic!r}: {path}")
+        if version <= 0:
+            raise ValueError(f"unsupported slot bin version {version}: {path}")
+        raw = f.read(n_saved * 4)
+        if len(raw) != n_saved * 4:
+            raise ValueError(f"slot bin token table truncated: expected {n_saved} tokens in {path}")
+    if n_saved == 0:
+        return []
+    return list(struct.unpack(f"<{n_saved}I", raw))
+
+
 class LlamaClient:
     def __init__(self, base_url: str):
         self.base_url = base_url.rstrip("/")
@@ -455,14 +483,24 @@ class PrefixCache:
 
     def total_bytes(self) -> int:
         with contextlib.closing(self.connect()) as db:
-            row = db.execute("SELECT COALESCE(SUM(size_bytes), 0) FROM nodes").fetchone()
+            row = db.execute(
+                """
+                SELECT COALESCE(SUM(size_bytes), 0)
+                FROM (SELECT bin_file, MAX(size_bytes) AS size_bytes FROM nodes GROUP BY bin_file)
+                """
+            ).fetchone()
         return int(row[0])
 
     def prune(self, *, max_bytes: int | None, max_nodes: int | None, dry_run: bool) -> list[dict[str, Any]]:
         removed: list[dict[str, Any]] = []
         with contextlib.closing(self.connect()) as db:
             while True:
-                total_bytes = int(db.execute("SELECT COALESCE(SUM(size_bytes), 0) FROM nodes").fetchone()[0])
+                total_bytes = int(db.execute(
+                    """
+                    SELECT COALESCE(SUM(size_bytes), 0)
+                    FROM (SELECT bin_file, MAX(size_bytes) AS size_bytes FROM nodes GROUP BY bin_file)
+                    """
+                ).fetchone()[0])
                 total_nodes = int(db.execute("SELECT COUNT(*) FROM nodes").fetchone()[0])
                 over_bytes = max_bytes is not None and total_bytes > max_bytes
                 over_nodes = max_nodes is not None and total_nodes > max_nodes
@@ -489,11 +527,15 @@ class PrefixCache:
                     # Simulate only one candidate in dry-run to avoid fake totals.
                     break
                 db.execute("DELETE FROM nodes WHERE id = ?", (node["id"],))
-                bin_path = self.absolute_bin_path(node["bin_file"])
-                try:
-                    bin_path.unlink()
-                except FileNotFoundError:
-                    pass
+                remaining_refs = int(
+                    db.execute("SELECT COUNT(*) FROM nodes WHERE bin_file = ?", (node["bin_file"],)).fetchone()[0]
+                )
+                if remaining_refs == 0:
+                    bin_path = self.absolute_bin_path(node["bin_file"])
+                    try:
+                        bin_path.unlink()
+                    except FileNotFoundError:
+                        pass
                 db.commit()
         return removed
 

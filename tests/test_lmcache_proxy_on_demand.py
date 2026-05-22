@@ -5,6 +5,7 @@ import json
 import os
 import pathlib
 import shutil
+import struct
 import sys
 import tempfile
 import time
@@ -347,6 +348,235 @@ class LMCacheProxyOnDemandTests(unittest.TestCase):
             self.assertEqual(saved_node["token_count"], len(saved_tokens))
             self.assertGreater(saved_node["n_saved"], saved_node["token_count"])
 
+    def test_autosave_inserts_verified_generated_prefix_node_sharing_bin(self):
+        with tempfile.TemporaryDirectory() as cache_dir_str:
+            cache = prefix_cache.PrefixCache(pathlib.Path(cache_dir_str))
+            cache.init()
+
+            prompt = "hello "
+            generated = "world"
+            prompt_tokens = list(prompt.encode("utf-8"))
+            full_tokens = list((prompt + generated).encode("utf-8"))
+            ctx = lmcache.RequestCacheContext(prompt_text=prompt, prompt_tokens=prompt_tokens, anchors=[])
+            result = lmcache.ForwardResult(
+                200,
+                "text/event-stream",
+                b'data: {"choices":[{"delta":{"content":"wor"}}]}\n\n'
+                b'data: {"choices":[{"delta":{"content":"ld"}}]}\n\n'
+                b'data: [DONE]\n\n',
+            )
+            handler, _ = self._make_handler({"prompt": prompt, "stream": True})
+            handler.prefix_cache_obj = cache
+            handler.auto_save_enabled = True
+            handler.generated_prefix_enabled = True
+            handler.min_save_tokens = 1
+            handler.max_cache_bytes = 2 * lmcache.GIB
+            handler.min_free_bytes = 1
+            handler.slot_id = 0
+
+            def fake_call(method, path, body=None, server="localhost", port=8081, timeout=30):
+                if path == "/tokenize":
+                    return {"tokens": list(body["content"].encode("utf-8"))}
+                if path == "/props":
+                    return {"model_alias": "mock", "model_path": "/tmp/mock.gguf", "default_generation_settings": {"n_ctx": 4096}}
+                raise AssertionError((method, path, body))
+
+            def fake_save(slot_id, bin_file, server="localhost", port=8081):
+                payload = struct.pack("<4sII", b"qsgg", 2, len(full_tokens))
+                payload += struct.pack(f"<{len(full_tokens)}I", *full_tokens)
+                cache.absolute_bin_path(bin_file).write_bytes(payload + b"kv")
+                return {"n_saved": len(full_tokens), "filename": bin_file}
+
+            with mock.patch.object(lmcache, "_call_llama", side_effect=fake_call), \
+                 mock.patch.object(lmcache, "_save_slot", side_effect=fake_save):
+                handler._auto_save_prefix_cache(ctx, {"prompt": prompt, "stream": True}, result)
+
+            prompt_id, _ = prefix_cache.node_id_for(prompt_tokens)
+            generated_id, _ = prefix_cache.node_id_for(full_tokens)
+            prompt_node = cache.get_node(prompt_id)
+            generated_node = cache.get_node(generated_id)
+            self.assertIsNotNone(prompt_node)
+            self.assertIsNotNone(generated_node)
+            self.assertEqual(generated_node["parent_id"], prompt_id)
+            self.assertEqual(generated_node["boundary"], "auto-generated-response")
+            self.assertEqual(generated_node["token_count"], len(full_tokens))
+            self.assertEqual(prompt_node["bin_file"], generated_node["bin_file"])
+            bin_path = cache.absolute_bin_path(prompt_node["bin_file"])
+            self.assertTrue(bin_path.exists())
+            self.assertEqual(cache.total_bytes(), prompt_node["size_bytes"])
+
+            removed = cache.prune(max_bytes=None, max_nodes=1, dry_run=False)
+            self.assertEqual(len(removed), 1)
+            self.assertTrue(bin_path.exists())
+            self.assertEqual(cache.total_bytes(), prompt_node["size_bytes"])
+
+            removed = cache.prune(max_bytes=None, max_nodes=0, dry_run=False)
+            self.assertEqual(len(removed), 1)
+            self.assertFalse(bin_path.exists())
+            self.assertEqual(cache.total_bytes(), 0)
+
+    def test_autosave_inserts_partial_generated_prefix_on_bad_stream_suffix(self):
+        with tempfile.TemporaryDirectory() as cache_dir_str:
+            cache = prefix_cache.PrefixCache(pathlib.Path(cache_dir_str))
+            cache.init()
+
+            prompt = "hello "
+            slot_generated = "world"
+            bad_stream = "worXYZ"
+            prompt_tokens = list(prompt.encode("utf-8"))
+            slot_tokens = list((prompt + slot_generated).encode("utf-8"))
+            verified_tokens = list((prompt + "wor").encode("utf-8"))
+            bad_full_tokens = list((prompt + bad_stream).encode("utf-8"))
+            ctx = lmcache.RequestCacheContext(prompt_text=prompt, prompt_tokens=prompt_tokens, anchors=[])
+            result = lmcache.ForwardResult(
+                200,
+                "text/event-stream",
+                b'data: {"choices":[{"delta":{"content":"worXYZ"}}]}\n\n'
+                b'data: [DONE]\n\n',
+            )
+            handler, _ = self._make_handler({"prompt": prompt, "stream": True})
+            handler.prefix_cache_obj = cache
+            handler.auto_save_enabled = True
+            handler.generated_prefix_enabled = True
+            handler.min_save_tokens = 1
+            handler.max_cache_bytes = 2 * lmcache.GIB
+            handler.min_free_bytes = 1
+            handler.slot_id = 0
+
+            def fake_call(method, path, body=None, server="localhost", port=8081, timeout=30):
+                if path == "/tokenize":
+                    return {"tokens": list(body["content"].encode("utf-8"))}
+                if path == "/props":
+                    return {"model_alias": "mock", "model_path": "/tmp/mock.gguf", "default_generation_settings": {"n_ctx": 4096}}
+                raise AssertionError((method, path, body))
+
+            def fake_save(slot_id, bin_file, server="localhost", port=8081):
+                payload = struct.pack("<4sII", b"qsgg", 2, len(slot_tokens))
+                payload += struct.pack(f"<{len(slot_tokens)}I", *slot_tokens)
+                cache.absolute_bin_path(bin_file).write_bytes(payload + b"kv")
+                return {"n_saved": len(slot_tokens), "filename": bin_file}
+
+            with mock.patch.object(lmcache, "_call_llama", side_effect=fake_call), \
+                 mock.patch.object(lmcache, "_save_slot", side_effect=fake_save):
+                handler._auto_save_prefix_cache(ctx, {"prompt": prompt, "stream": True}, result)
+
+            verified_id, _ = prefix_cache.node_id_for(verified_tokens)
+            bad_full_id, _ = prefix_cache.node_id_for(bad_full_tokens)
+            verified_node = cache.get_node(verified_id)
+            self.assertIsNotNone(verified_node)
+            self.assertEqual(verified_node["boundary"], "auto-generated-response")
+            self.assertEqual(verified_node["token_count"], len(verified_tokens))
+            self.assertIsNone(cache.get_node(bad_full_id))
+
+    def test_autosave_ignores_tool_call_only_stream_for_generated_node(self):
+        with tempfile.TemporaryDirectory() as cache_dir_str:
+            cache = prefix_cache.PrefixCache(pathlib.Path(cache_dir_str))
+            cache.init()
+
+            prompt = "call a tool: "
+            prompt_tokens = list(prompt.encode("utf-8"))
+            slot_tokens = list((prompt + '{"name":"search"}').encode("utf-8"))
+            ctx = lmcache.RequestCacheContext(prompt_text=prompt, prompt_tokens=prompt_tokens, anchors=[])
+            result = lmcache.ForwardResult(
+                200,
+                "text/event-stream",
+                b'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"search","arguments":"{}"}}]}}]}\n\n'
+                b'data: [DONE]\n\n',
+            )
+            handler, _ = self._make_handler({"prompt": prompt, "stream": True})
+            handler.prefix_cache_obj = cache
+            handler.auto_save_enabled = True
+            handler.generated_prefix_enabled = True
+            handler.min_save_tokens = 1
+            handler.max_cache_bytes = 2 * lmcache.GIB
+            handler.min_free_bytes = 1
+            handler.slot_id = 0
+
+            def fake_call(method, path, body=None, server="localhost", port=8081, timeout=30):
+                if path == "/tokenize":
+                    return {"tokens": list(body["content"].encode("utf-8"))}
+                if path == "/props":
+                    return {"model_alias": "mock", "model_path": "/tmp/mock.gguf", "default_generation_settings": {"n_ctx": 4096}}
+                raise AssertionError((method, path, body))
+
+            def fake_save(slot_id, bin_file, server="localhost", port=8081):
+                payload = struct.pack("<4sII", b"qsgg", 2, len(slot_tokens))
+                payload += struct.pack(f"<{len(slot_tokens)}I", *slot_tokens)
+                cache.absolute_bin_path(bin_file).write_bytes(payload + b"kv")
+                return {"n_saved": len(slot_tokens), "filename": bin_file}
+
+            with mock.patch.object(lmcache, "_call_llama", side_effect=fake_call), \
+                 mock.patch.object(lmcache, "_save_slot", side_effect=fake_save):
+                handler._auto_save_prefix_cache(ctx, {"prompt": prompt, "stream": True}, result)
+
+            prompt_id, _ = prefix_cache.node_id_for(prompt_tokens)
+            self.assertIsNotNone(cache.get_node(prompt_id))
+            self.assertEqual(
+                [n for n in cache.list_nodes() if n["boundary"] == "auto-generated-response"],
+                [],
+            )
+
+    def test_prefix_cache_restores_generated_response_node_as_longest_prefix(self):
+        with tempfile.TemporaryDirectory() as cache_dir_str:
+            cache = prefix_cache.PrefixCache(pathlib.Path(cache_dir_str))
+            cache.init()
+            prompt = "hello "
+            generated = "world"
+            incoming = prompt + generated + " suffix"
+            prompt_tokens = list(prompt.encode("utf-8"))
+            generated_tokens = list((prompt + generated).encode("utf-8"))
+            prompt_id, prompt_digest = prefix_cache.node_id_for(prompt_tokens)
+            generated_id, generated_digest = prefix_cache.node_id_for(generated_tokens)
+            bin_file = cache.relative_node_bin(prompt_id)
+            cache.absolute_bin_path(bin_file).write_bytes(b"shared")
+            cache.insert_node({
+                "id": prompt_id,
+                "parent_id": None,
+                "label": "auto",
+                "boundary": "auto-response",
+                "token_count": len(prompt_tokens),
+                "prefix_hash": prompt_digest,
+                "hash_algo": prefix_cache.HASH_ALGO,
+                "bin_file": bin_file,
+                "size_bytes": 6,
+                "n_saved": len(generated_tokens),
+                "created_at": prefix_cache.utc_now(),
+            })
+            cache.insert_node({
+                "id": generated_id,
+                "parent_id": prompt_id,
+                "label": "auto-generated",
+                "boundary": "auto-generated-response",
+                "token_count": len(generated_tokens),
+                "prefix_hash": generated_digest,
+                "hash_algo": prefix_cache.HASH_ALGO,
+                "bin_file": bin_file,
+                "size_bytes": 6,
+                "n_saved": len(generated_tokens),
+                "created_at": prefix_cache.utc_now(),
+            })
+
+            handler, body_bytes = self._make_handler({"prompt": incoming})
+            handler._forward = mock.Mock(return_value=lmcache.ForwardResult(200, "application/json", b'{}'))
+            handler.prefix_cache_obj = cache
+            handler.cache_dir_obj = None
+            handler.auto_save_enabled = False
+            handler.prefix_cache_enabled = True
+            handler.strict_prefix_restore = True
+            handler.slot_id = 0
+
+            def fake_call(method, path, body=None, server="localhost", port=8081, timeout=30):
+                if path == "/tokenize":
+                    return {"tokens": list(body["content"].encode("utf-8"))}
+                raise AssertionError((method, path, body))
+
+            with mock.patch.object(lmcache, "_call_llama", side_effect=fake_call), \
+                 mock.patch.object(lmcache, "_restore_slot", return_value={"n_restored": len(generated_tokens)}) as restore:
+                handler._handle_request("POST")
+
+            restore.assert_called_once_with(0, bin_file, "localhost", 8081)
+            handler._forward.assert_called_once_with("POST", "/completion", body_bytes)
+
     def test_chat_completions_autosave_keys_known_rendered_prompt(self):
         with tempfile.TemporaryDirectory() as cache_dir_str:
             cache = prefix_cache.PrefixCache(pathlib.Path(cache_dir_str))
@@ -560,7 +790,7 @@ class LMCacheProxyOnDemandTests(unittest.TestCase):
             save.assert_not_called()
             handler._forward.assert_called_once_with("POST", "/v1/chat/completions", body_bytes)
 
-    def test_prefix_cache_does_not_restore_exact_match_by_default(self):
+    def test_prefix_cache_exact_match_appends_newline_workaround(self):
         with tempfile.TemporaryDirectory() as cache_dir_str:
             cache = prefix_cache.PrefixCache(pathlib.Path(cache_dir_str))
             cache.init()
@@ -600,8 +830,9 @@ class LMCacheProxyOnDemandTests(unittest.TestCase):
                  mock.patch.object(lmcache, "_restore_slot", return_value={"n_restored": len(tokens)}) as restore:
                 handler._handle_request("POST")
 
-            restore.assert_not_called()
-            handler._forward.assert_called_once_with("POST", "/completion", body_bytes)
+            restore.assert_called_once_with(0, bin_file, "localhost", 8081)
+            forwarded_body = json.loads(handler._forward.call_args.args[2].decode("utf-8"))
+            self.assertEqual(forwarded_body["prompt"], prompt + "\n")
 
     def test_prefix_cache_low_storage_skips_autosave_gracefully(self):
         with tempfile.TemporaryDirectory() as cache_dir_str:
@@ -656,20 +887,27 @@ class LMCacheProxyLiveChatTests(unittest.TestCase):
 
     def tearDown(self):
         cache = prefix_cache.PrefixCache(self.cache_dir)
-        for node_id in reversed(self.created_node_ids):
+        bin_files = set()
+        for node_id in self.created_node_ids:
             node = cache.get_node(node_id)
-            if not node:
-                continue
+            if node:
+                bin_files.add(node["bin_file"])
+        if not bin_files:
+            return
+
+        db = cache.connect()
+        try:
+            for bin_file in bin_files:
+                db.execute("DELETE FROM nodes WHERE bin_file = ?", (bin_file,))
+            db.commit()
+        finally:
+            db.close()
+
+        for bin_file in bin_files:
             try:
-                cache.absolute_bin_path(node["bin_file"]).unlink()
+                cache.absolute_bin_path(bin_file).unlink()
             except FileNotFoundError:
                 pass
-            db = cache.connect()
-            try:
-                db.execute("DELETE FROM nodes WHERE id = ?", (node_id,))
-                db.commit()
-            finally:
-                db.close()
 
     def post_json(self, path, body, *, timeout=120):
         req = urllib.request.Request(
@@ -711,6 +949,59 @@ class LMCacheProxyLiveChatTests(unittest.TestCase):
         self.assertEqual(node["token_count"], len(tokens))
         self.assertGreaterEqual(node["n_saved"], node["token_count"])
         self.assertTrue((self.cache_dir / node["bin_file"]).exists())
+
+    def test_live_completion_autosaves_full_generated_response_node(self):
+        marker = f"LIVE-COMPLETION-GENERATED-CACHE-{time.time_ns()}"
+        prompt = marker + "\n" + ("cacheword " * 320) + "\nAnswer with exactly: alpha beta gamma.\n"
+        prompt_tokens = [int(t) for t in self.post_json("/tokenize", {"content": prompt})["tokens"]]
+        prompt_node_id, _ = prefix_cache.node_id_for(prompt_tokens)
+        self.created_node_ids.append(prompt_node_id)
+
+        body = {
+            "prompt": prompt,
+            "stream": True,
+            "n_predict": 8,
+            "temperature": 0.0,
+        }
+        req = urllib.request.Request(
+            self.base_url + "/completion",
+            data=json.dumps(body).encode(),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=300) as resp:
+            for _ in resp:
+                pass
+
+        time.sleep(0.5)
+        cache = prefix_cache.PrefixCache(self.cache_dir)
+        prompt_node = cache.get_node(prompt_node_id)
+        self.assertIsNotNone(prompt_node)
+        self.assertEqual(prompt_node["boundary"], "auto-response")
+        self.assertGreater(prompt_node["n_saved"], prompt_node["token_count"])
+
+        db = cache.connect()
+        try:
+            rows = db.execute(
+                """
+                SELECT * FROM nodes
+                WHERE boundary = 'auto-generated-response'
+                  AND bin_file = ?
+                  AND token_count > ?
+                ORDER BY token_count DESC
+                """,
+                (prompt_node["bin_file"], prompt_node["token_count"]),
+            ).fetchall()
+        finally:
+            db.close()
+
+        self.assertGreaterEqual(len(rows), 1)
+        generated = dict(rows[0])
+        self.created_node_ids.append(generated["id"])
+        self.assertEqual(generated["bin_file"], prompt_node["bin_file"])
+        self.assertGreater(generated["token_count"], prompt_node["token_count"])
+        self.assertGreaterEqual(generated["n_saved"], generated["token_count"])
+        self.assertTrue((self.cache_dir / generated["bin_file"]).exists())
 
 
 if __name__ == "__main__":

@@ -9,6 +9,7 @@ post-generation slot state back into the trie.
 import argparse
 import hashlib
 import json
+import copy
 import logging
 import pathlib
 import shutil
@@ -102,6 +103,8 @@ class RequestCacheContext:
     anchors: list[RequestAnchor]
     restored_node_id: str | None = None
     restored_via: str | None = None
+    exact_prefix_newline_workaround: bool = False
+    exact_prefix_node_id: str | None = None
 
 
 @dataclass
@@ -186,6 +189,7 @@ class LMCacheHandler(BaseHTTPRequestHandler):
     max_cache_bytes = 2 * GIB
     min_free_bytes = 512 * MIB
     strict_prefix_restore = True
+    generated_prefix_enabled = True
     anchor_configs: list[AnchorConfig] = []
 
     def _forward(self, method: str, path: str, body_bytes: bytes) -> ForwardResult | None:
@@ -433,6 +437,71 @@ class LMCacheHandler(BaseHTTPRequestHandler):
         log.info("prefix-cache materialized anchor node %s (%d tokens, %.1f MiB)", node_id, len(anchor.tokens), size_bytes / MIB)
         return cache.get_node(node_id)
 
+    @staticmethod
+    def _append_newline_to_request_body(path: str, body: dict) -> dict | None:
+        modified = copy.deepcopy(body)
+        if isinstance(modified.get("prompt"), str):
+            modified["prompt"] += "\n"
+            return modified
+
+        if not (path.startswith("/v1/chat/completions") or path.startswith("/chat/completions")):
+            return None
+        messages = modified.get("messages")
+        if not isinstance(messages, list) or not messages:
+            return None
+        last = messages[-1]
+        if not isinstance(last, dict):
+            return None
+        content = last.get("content")
+        if isinstance(content, str):
+            last["content"] = content + "\n"
+            return modified
+        if isinstance(content, list):
+            content.append({"type": "text", "text": "\n"})
+            return modified
+        return None
+
+    def _maybe_apply_exact_prefix_newline_workaround(
+        self,
+        path: str,
+        body: dict,
+        ctx: RequestCacheContext,
+    ) -> tuple[dict, RequestCacheContext, bytes | None]:
+        cache = self.prefix_cache_obj
+        if cache is None or not self.strict_prefix_restore:
+            return body, ctx, None
+
+        exact = cache.lookup(ctx.prompt_tokens, touch=False, strictly_less=False)
+        if not exact or int(exact.get("token_count", -1)) != len(ctx.prompt_tokens):
+            return body, ctx, None
+
+        modified = self._append_newline_to_request_body(path, body)
+        if modified is None:
+            log.warning(
+                "prefix-cache exact-prefix newline workaround unavailable for node %s on %s; falling back to strict-prefix lookup",
+                exact.get("id"),
+                path,
+            )
+            return body, ctx, None
+
+        modified_ctx = self._request_cache_context(path, modified)
+        if modified_ctx is None:
+            return body, ctx, None
+        if modified_ctx.prompt_tokens[: len(ctx.prompt_tokens)] != ctx.prompt_tokens:
+            log.warning(
+                "prefix-cache exact-prefix newline workaround skipped for node %s: appended newline did not preserve token prefix",
+                exact.get("id"),
+            )
+            return body, ctx, None
+
+        modified_ctx.exact_prefix_newline_workaround = True
+        modified_ctx.exact_prefix_node_id = str(exact.get("id"))
+        log.info(
+            "prefix-cache exact-prefix newline workaround: appended newline so node %s is restored as a strict prefix",
+            exact.get("id"),
+        )
+        return modified, modified_ctx, json.dumps(modified, separators=(",", ":")).encode("utf-8")
+
     def _lookup_and_restore_prefix(self, ctx: RequestCacheContext) -> None:
         cache = self.prefix_cache_obj
         if cache is None:
@@ -515,6 +584,104 @@ class LMCacheHandler(BaseHTTPRequestHandler):
         props = _call_llama("GET", "/props", None, self.llama_server, self.llama_port, timeout=30)
         return props if isinstance(props, dict) else {}
 
+    @staticmethod
+    def _text_fragments_from_event(obj) -> list[str]:
+        fragments: list[str] = []
+        if not isinstance(obj, dict):
+            return fragments
+
+        choices = obj.get("choices")
+        if isinstance(choices, list):
+            for choice in choices:
+                if not isinstance(choice, dict):
+                    continue
+                delta = choice.get("delta")
+                if isinstance(delta, dict):
+                    for key in ("reasoning_content", "content", "text"):
+                        value = delta.get(key)
+                        if isinstance(value, str):
+                            fragments.append(value)
+                message = choice.get("message")
+                if isinstance(message, dict):
+                    for key in ("reasoning_content", "content"):
+                        value = message.get(key)
+                        if isinstance(value, str):
+                            fragments.append(value)
+                value = choice.get("text")
+                if isinstance(value, str):
+                    fragments.append(value)
+
+        for key in ("content", "response", "text"):
+            value = obj.get(key)
+            if isinstance(value, str):
+                fragments.append(value)
+        return fragments
+
+    @classmethod
+    def _captured_response_text(cls, result: ForwardResult) -> str | None:
+        fragments: list[str] = []
+        body_text = result.body.decode("utf-8", errors="replace")
+
+        if "text/event-stream" in result.content_type:
+            for line in body_text.splitlines():
+                line = line.strip()
+                if not line.startswith("data:"):
+                    continue
+                data = line[5:].strip()
+                if not data or data == "[DONE]":
+                    continue
+                try:
+                    event = json.loads(data)
+                except json.JSONDecodeError:
+                    continue
+                fragments.extend(cls._text_fragments_from_event(event))
+        else:
+            try:
+                obj = json.loads(body_text) if body_text else {}
+            except json.JSONDecodeError:
+                obj = {}
+            fragments.extend(cls._text_fragments_from_event(obj))
+
+        text = "".join(fragments)
+        return text if text else None
+
+    @staticmethod
+    def _lcp_len(left: list[int], right: list[int]) -> int:
+        limit = min(len(left), len(right))
+        i = 0
+        while i < limit and left[i] == right[i]:
+            i += 1
+        return i
+
+    def _verified_generated_prefix_tokens(
+        self,
+        ctx: RequestCacheContext,
+        result: ForwardResult,
+        slot_tokens: list[int] | None,
+    ) -> list[int] | None:
+        if not self.generated_prefix_enabled or not slot_tokens or len(slot_tokens) <= len(ctx.prompt_tokens):
+            return None
+        if slot_tokens[: len(ctx.prompt_tokens)] != ctx.prompt_tokens:
+            log.warning("prefix-cache generated-node skipped: saved slot tokens do not start with prompt tokens")
+            return None
+
+        response_text = self._captured_response_text(result)
+        if not response_text:
+            return None
+        optimistic_tokens = self._tokenize(ctx.prompt_text + response_text)
+        if not optimistic_tokens:
+            return None
+
+        lcp = self._lcp_len(optimistic_tokens, slot_tokens)
+        if lcp <= len(ctx.prompt_tokens):
+            log.debug(
+                "prefix-cache generated-node skipped: captured response verified only %d/%d prompt tokens",
+                lcp,
+                len(ctx.prompt_tokens),
+            )
+            return None
+        return slot_tokens[:lcp]
+
     def _auto_save_prefix_cache(self, ctx: RequestCacheContext, request_body: dict, result: ForwardResult | None) -> None:
         if not self.auto_save_enabled or self.prefix_cache_obj is None or result is None:
             return
@@ -552,8 +719,31 @@ class LMCacheHandler(BaseHTTPRequestHandler):
             log.warning("prefix-cache autosave skipped: save succeeded but bin is missing: %s", tmp_path)
             return
 
+        slot_tokens: list[int] | None = None
+        try:
+            slot_tokens = prefix_cache.read_slot_bin_tokens(tmp_path)
+        except Exception as e:
+            log.debug("prefix-cache autosave could not parse slot token table for generated node: %s", e)
+        if slot_tokens is not None and slot_tokens[: len(tokens)] != tokens:
+            log.warning("prefix-cache autosave skipped: saved slot token prefix does not match rendered prompt tokens")
+            try:
+                tmp_path.unlink()
+            except FileNotFoundError:
+                pass
+            return
+
         node_id, digest = prefix_cache.node_id_for(tokens)
-        if cache.get_node(node_id):
+        prompt_exists = cache.get_node(node_id) is not None
+
+        generated_tokens = self._verified_generated_prefix_tokens(ctx, result, slot_tokens)
+        generated_node_id = None
+        generated_digest = None
+        generated_exists = True
+        if generated_tokens is not None:
+            generated_node_id, generated_digest = prefix_cache.node_id_for(generated_tokens)
+            generated_exists = cache.get_node(generated_node_id) is not None
+
+        if prompt_exists and (generated_node_id is None or generated_exists):
             log.debug("prefix-cache autosave skipped: node already exists %s", node_id)
             try:
                 tmp_path.unlink()
@@ -561,11 +751,17 @@ class LMCacheHandler(BaseHTTPRequestHandler):
                 pass
             return
 
-        parent_id = cache.parent_for(tokens, node_id)
-        bin_file = cache.relative_node_bin(node_id)
+        primary_bin_node_id = node_id if not prompt_exists else generated_node_id
+        if primary_bin_node_id is None:
+            try:
+                tmp_path.unlink()
+            except FileNotFoundError:
+                pass
+            return
+        bin_file = cache.relative_node_bin(primary_bin_node_id)
         bin_path = cache.absolute_bin_path(bin_file)
         if bin_path.exists():
-            log.warning("prefix-cache autosave skipped: bin exists without DB node: %s", bin_path)
+            log.warning("prefix-cache autosave skipped: bin exists without expected DB node: %s", bin_path)
             try:
                 tmp_path.unlink()
             except FileNotFoundError:
@@ -576,49 +772,97 @@ class LMCacheHandler(BaseHTTPRequestHandler):
 
         props = self._props()
         settings = props.get("default_generation_settings", {}) if isinstance(props, dict) else {}
-        node = {
-            "id": node_id,
-            "parent_id": parent_id,
-            "label": "auto",
-            "boundary": "auto-response",
-            "token_count": len(tokens),
-            "prefix_hash": digest,
-            "hash_algo": prefix_cache.HASH_ALGO,
-            "bin_file": bin_file,
-            "size_bytes": size_bytes,
-            "n_saved": n_saved,
-            "model_alias": props.get("model_alias") if isinstance(props, dict) else None,
-            "model_path": props.get("model_path") if isinstance(props, dict) else None,
-            "ctx_size": settings.get("n_ctx") if isinstance(settings, dict) else None,
-            "hits": 0,
-            "created_at": prefix_cache.utc_now(),
-            "last_used": None,
-            "pinned": False,
-            "meta": {
-                "source": "lmcache-proxy-on-demand",
-                "restored_node_id": ctx.restored_node_id,
-                "save_response": save,
-                "response_content_type": result.content_type,
-            },
+        common_meta = {
+            "source": "lmcache-proxy-on-demand",
+            "restored_node_id": ctx.restored_node_id,
+            "save_response": save,
+            "response_content_type": result.content_type,
+            "exact_prefix_newline_workaround": ctx.exact_prefix_newline_workaround,
+            "exact_prefix_node_id": ctx.exact_prefix_node_id,
         }
-        cache.insert_node(node)
-        for anchor in ctx.anchors:
-            anchor_id, anchor_digest = prefix_cache.node_id_for(anchor.tokens)
-            cache.insert_anchor({
-                "node_id": node_id,
-                "label": anchor.config.label,
-                "token_count": len(anchor.tokens),
-                "prefix_hash": anchor_digest,
+        inserted_nodes: list[str] = []
+
+        if not prompt_exists:
+            parent_id = cache.parent_for(tokens, node_id)
+            node = {
+                "id": node_id,
+                "parent_id": parent_id,
+                "label": "auto",
+                "boundary": "auto-response",
+                "token_count": len(tokens),
+                "prefix_hash": digest,
                 "hash_algo": prefix_cache.HASH_ALGO,
-                "marker": anchor.config.marker,
-                "occurrence": anchor.config.occurrence,
-                "side": anchor.config.side,
-                "pinned": anchor.config.pinned,
+                "bin_file": bin_file,
+                "size_bytes": size_bytes,
+                "n_saved": n_saved,
+                "model_alias": props.get("model_alias") if isinstance(props, dict) else None,
+                "model_path": props.get("model_path") if isinstance(props, dict) else None,
+                "ctx_size": settings.get("n_ctx") if isinstance(settings, dict) else None,
+                "hits": 0,
                 "created_at": prefix_cache.utc_now(),
-                "meta": {"anchor_id": anchor_id},
-            })
+                "last_used": None,
+                "pinned": False,
+                "meta": common_meta,
+            }
+            cache.insert_node(node)
+            inserted_nodes.append(node_id)
+            for anchor in ctx.anchors:
+                anchor_id, anchor_digest = prefix_cache.node_id_for(anchor.tokens)
+                cache.insert_anchor({
+                    "node_id": node_id,
+                    "label": anchor.config.label,
+                    "token_count": len(anchor.tokens),
+                    "prefix_hash": anchor_digest,
+                    "hash_algo": prefix_cache.HASH_ALGO,
+                    "marker": anchor.config.marker,
+                    "occurrence": anchor.config.occurrence,
+                    "side": anchor.config.side,
+                    "pinned": anchor.config.pinned,
+                    "created_at": prefix_cache.utc_now(),
+                    "meta": {"anchor_id": anchor_id},
+                })
+
+        if generated_tokens is not None and generated_node_id is not None and generated_digest is not None and not generated_exists:
+            generated_node = {
+                "id": generated_node_id,
+                "parent_id": node_id if cache.get_node(node_id) else cache.parent_for(generated_tokens, generated_node_id),
+                "label": "auto-generated",
+                "boundary": "auto-generated-response",
+                "token_count": len(generated_tokens),
+                "prefix_hash": generated_digest,
+                "hash_algo": prefix_cache.HASH_ALGO,
+                "bin_file": bin_file,
+                "size_bytes": size_bytes,
+                "n_saved": n_saved,
+                "model_alias": props.get("model_alias") if isinstance(props, dict) else None,
+                "model_path": props.get("model_path") if isinstance(props, dict) else None,
+                "ctx_size": settings.get("n_ctx") if isinstance(settings, dict) else None,
+                "hits": 0,
+                "created_at": prefix_cache.utc_now(),
+                "last_used": None,
+                "pinned": False,
+                "meta": {
+                    **common_meta,
+                    "prompt_node_id": node_id,
+                    "prompt_token_count": len(tokens),
+                    "verified_generated_tokens": len(generated_tokens) - len(tokens),
+                    "slot_token_count": len(slot_tokens) if slot_tokens is not None else None,
+                },
+            }
+            cache.insert_node(generated_node)
+            inserted_nodes.append(generated_node_id)
+
         cache.prune(max_bytes=self.max_cache_bytes, max_nodes=None, dry_run=False)
-        log.info("prefix-cache autosaved node %s (%d tokens, %.1f MiB, anchors=%d)", node_id, len(tokens), size_bytes / MIB, len(ctx.anchors))
+        log.info(
+            "prefix-cache autosaved %d node(s): prompt=%s generated=%s (%d→%d saved tokens, %.1f MiB, anchors=%d)",
+            len(inserted_nodes),
+            node_id if not prompt_exists else "exists",
+            generated_node_id if generated_node_id and not generated_exists else None,
+            len(tokens),
+            n_saved,
+            size_bytes / MIB,
+            len(ctx.anchors),
+        )
 
     def _handle_request(self, method: str):
         content_length = int(self.headers.get("Content-Length", 0))
@@ -634,6 +878,11 @@ class LMCacheHandler(BaseHTTPRequestHandler):
 
         ctx = self._request_cache_context(path, body) if method == "POST" else None
         if ctx is not None:
+            modified_body, modified_ctx, modified_body_bytes = self._maybe_apply_exact_prefix_newline_workaround(path, body, ctx)
+            if modified_body_bytes is not None:
+                body = modified_body
+                body_bytes = modified_body_bytes
+                ctx = modified_ctx
             self._lookup_and_restore_prefix(ctx)
         else:
             self._restore_legacy_cache(body)
@@ -720,6 +969,7 @@ def main():
     parser.add_argument("--prefix-cache-min-free-bytes", type=parse_bytes, default=512 * MIB, help="Minimum filesystem free bytes before autosave (default: 512MiB)")
     parser.add_argument("--no-prefix-cache", action="store_true", help="Disable trie-backed prefix cache")
     parser.add_argument("--no-auto-save", action="store_true", help="Disable autosaving completed requests into prefix cache")
+    parser.add_argument("--no-generated-prefix-cache", action="store_true", help="Disable optimistic generated-response prefix nodes after stream completion")
     parser.add_argument("--allow-exact-prefix-restore", action="store_true", help="Allow restoring exact-length prefix matches (currently unsafe on this llama.cpp build)")
     args = parser.parse_args()
 
@@ -748,6 +998,7 @@ def main():
     LMCacheHandler.prefix_cache_obj = trie_cache
     LMCacheHandler.prefix_cache_enabled = trie_cache is not None
     LMCacheHandler.auto_save_enabled = not args.no_auto_save
+    LMCacheHandler.generated_prefix_enabled = not args.no_generated_prefix_cache
     LMCacheHandler.min_save_tokens = args.min_save_tokens
     LMCacheHandler.max_cache_bytes = args.prefix_cache_max_bytes
     LMCacheHandler.min_free_bytes = args.prefix_cache_min_free_bytes
@@ -765,12 +1016,13 @@ def main():
     log.info("KV cache dir: %s", cache_dir)
     if trie_cache is not None:
         log.info(
-            "prefix cache enabled: min_save_tokens=%d max_bytes=%d min_free_bytes=%d strict_prefix_restore=%s auto_save=%s anchors=%d",
+            "prefix cache enabled: min_save_tokens=%d max_bytes=%d min_free_bytes=%d strict_prefix_restore=%s auto_save=%s generated_prefix=%s anchors=%d",
             args.min_save_tokens,
             args.prefix_cache_max_bytes,
             args.prefix_cache_min_free_bytes,
             not args.allow_exact_prefix_restore,
             not args.no_auto_save,
+            not args.no_generated_prefix_cache,
             len(anchor_configs),
         )
 

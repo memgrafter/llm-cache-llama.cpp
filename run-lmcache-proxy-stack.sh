@@ -38,6 +38,7 @@ PREFIX_CACHE_MAX_BYTES="${PREFIX_CACHE_MAX_BYTES:-2GiB}"
 PREFIX_CACHE_MIN_FREE_BYTES="${PREFIX_CACHE_MIN_FREE_BYTES:-512MiB}"
 NO_AUTO_SAVE="${NO_AUTO_SAVE:-0}"
 NO_PREFIX_CACHE="${NO_PREFIX_CACHE:-0}"
+NO_GENERATED_PREFIX_CACHE="${NO_GENERATED_PREFIX_CACHE:-0}"
 ALLOW_EXACT_PREFIX_RESTORE="${ALLOW_EXACT_PREFIX_RESTORE:-0}"
 RESTORE_SLOT_ON_START="${RESTORE_SLOT_ON_START:-slot_0_current.bin}"
 RESTORE_SLOT_ID="${RESTORE_SLOT_ID:-0}"
@@ -188,6 +189,7 @@ proxy_args=(
 )
 if [[ "$NO_AUTO_SAVE" == "1" ]]; then proxy_args+=(--no-auto-save); fi
 if [[ "$NO_PREFIX_CACHE" == "1" ]]; then proxy_args+=(--no-prefix-cache); fi
+if [[ "$NO_GENERATED_PREFIX_CACHE" == "1" ]]; then proxy_args+=(--no-generated-prefix-cache); fi
 if [[ "$ALLOW_EXACT_PREFIX_RESTORE" == "1" ]]; then proxy_args+=(--allow-exact-prefix-restore); fi
 
 python3 lmcache-proxy-on-demand.py "${proxy_args[@]}" > "$PROXY_LOG" 2>&1 &
