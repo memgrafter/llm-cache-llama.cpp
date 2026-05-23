@@ -2,6 +2,8 @@
 
 This repo is a local llama.cpp server with a KV-cache proxy in front of it, tuned for a 16 GB Mac Mini running Qwen3.6-28B.
 
+**Note: This document was generated from data I curated. It was done with local `Qwen3.6-28B-REAP.i1-IQ3_XXS`. It's worth a scan.**
+
 ## The problem
 
 A 28B parameter model needs ~56 GB of RAM at FP16 to load. On a 16 GB machine that's impossible without aggressive quantization. Even quantized, the KV cache (one per active slot) eats hundreds of megabytes each — and llama.cpp's built-in multi-prompt RAM cache tries to keep multiple prompts in memory simultaneously, which crashes the machine.
