@@ -4,8 +4,6 @@ Run a local Qwen3.6 llama.cpp server behind a supervised KV-cache proxy so the p
 
 ## Quickstart
 
-From this repo:
-
 ```bash
 cd ~/code/llama.cpp-launch-scripts
 ```
@@ -36,14 +34,6 @@ curl -sS http://127.0.0.1:8081/health
 curl -sS http://127.0.0.1:8081/v1/models
 ```
 
-The first launch also initializes the prefix-cache SQLite DB and default chat anchor config:
-
-```text
-end-of-system-message: first <|im_end|>, side=after
-```
-
-On the first full-prefix miss for a new anchor value, the proxy automatically prefills that anchor once, saves an anchor-only KV node, and then forwards the original request unchanged. Later new chats with the same system anchor can restore that anchor-only node before processing the user-specific suffix.
-
 Clients, including pi, should use:
 
 ```text
@@ -59,36 +49,7 @@ kill "$(cat /tmp/lmcache-proxy-stack.pid)"
 
 When the supervisor/proxy stops, it also stops the llama.cpp backend.
 
-### Anchor creation
-
-Anchor config creation is automatic during DB init. Anchor KV creation is lazy: the first request whose rendered chat prompt contains a configured anchor will materialize an anchor-only node if no matching node exists yet. Watch for:
-
-```text
-prefix-cache materialized anchor node ...
-prefix-cache using newly materialized anchor node ...
-```
-
-Later matching requests should show a restore of that anchor node before the request is forwarded.
-
-## Interface guide
-
-### `run-lmcache-proxy-stack.sh` — recommended entrypoint
-
-This is the clean story for humans: run one script, get one public endpoint, stop one PID, and both proxy plus llama.cpp terminate together.
-
-Foreground, default:
-
-```bash
-./run-lmcache-proxy-stack.sh
-```
-
-Background supervisor:
-
-```bash
-./run-lmcache-proxy-stack.sh --background
-```
-
-Useful environment overrides:
+## Environment variables
 
 | Variable | Default | Meaning |
 |---|---:|---|
@@ -123,19 +84,7 @@ PUBLIC_PORT=8090 BACKEND_PORT=8091 ./run-lmcache-proxy-stack.sh
 
 The backend starts with an empty slot; the proxy restores the best disk-cache prefix on the first request.
 
-Inspect anchor configs:
-
-```bash
-sqlite3 ~/.cache/llama.cpp-launch-scripts/slot-kv/trie/prefix-cache.sqlite \
-  'select label, marker, occurrence, side, pinned, enabled from anchor_configs;'
-```
-
-Inspect materialized anchor KV nodes:
-
-```bash
-sqlite3 ~/.cache/llama.cpp-launch-scripts/slot-kv/trie/prefix-cache.sqlite \
-  "select id, label, token_count, n_saved, size_bytes from nodes where boundary='anchor';"
-```
+## PID files and logs
 
 PID files:
 
@@ -152,79 +101,6 @@ logs/stack-*.log                # when started with --background, or if redirect
 logs/qwen36-backend-*.log
 logs/lmcache-proxy-*.log
 ```
-
-### `lmcache-proxy-on-demand.py` — proxy only
-
-Runs only the Python proxy. Use this directly only if you are managing llama.cpp yourself.
-
-```bash
-python3 lmcache-proxy-on-demand.py \
-  --host 127.0.0.1 \
-  --port 8081 \
-  --server 127.0.0.1 \
-  --llama-port 8082 \
-  --cache-dir ~/.cache/llama.cpp-launch-scripts/slot-kv \
-  --top-k 3 \
-  --min-save-tokens 256 \
-  --prefix-cache-max-bytes 4GiB \
-  --prefix-cache-min-free-bytes 512MiB
-```
-
-Flags:
-
-| Flag | Meaning |
-|---|---|
-| `--host` | Proxy bind host. |
-| `--port` | Proxy public port. |
-| `--server` | llama.cpp backend host. |
-| `--llama-port` | llama.cpp backend port. |
-| `--cache-dir` | Disk KV cache directory. |
-| `--top-k` | Legacy cache fallback candidate count. |
-| `--min-save-tokens` | Minimum rendered-prompt token count before automatic prefix-cache autosave. |
-| `--prefix-cache-max-bytes` | Trie-backed prefix-cache size limit. |
-| `--prefix-cache-min-free-bytes` | Minimum filesystem free space before autosave. |
-| `--no-auto-save` | Restore matching prefixes but do not save completed requests. |
-| `--no-prefix-cache` | Disable trie-backed prefix-cache integration. |
-| `--no-generated-prefix-cache` | Disable optimistic generated-response prefix nodes after stream completion. |
-| `--allow-exact-prefix-restore` | Allow exact-length prefix restores; unsafe on the current llama.cpp build. |
-
-On each request, the proxy renders/tokenizes the prompt, restores the best strict-prefix trie node into slot 0, forwards the request, streams the response, then saves the slot and records a trie node keyed by the incoming rendered prompt tokens. If an exact cached prefix is found while exact restores are disabled, the proxy may append a newline and restore the exact node as a strict-prefix workaround for the current llama.cpp crash. When the saved slot bin exposes token IDs and the captured stream text verifies against those token IDs, the proxy also records an optimistic generated-response prefix node that points at the same bin. If full-prefix lookup misses, the first request for a configured anchor such as `end-of-system-message` materializes an anchor-only KV node; later requests restore that materialized anchor node.
-
-### `run-qwen36-reap.sh` — backend only
-
-Launches llama.cpp directly. In the supervised proxy stack, this is called by `run-lmcache-proxy-stack.sh` with `PORT=8082`.
-
-Important defaults:
-
-```text
-ALIAS=qwen3.6-28b-reap-iq3xxs-turbo3-35k
-SLOT_SAVE_PATH=~/.cache/llama.cpp-launch-scripts/slot-kv
-CACHE_RAM=0
-CACHE_REUSE=256
-```
-
-`CACHE_RAM=0` disables llama.cpp's separate multi-prompt RAM cache. Explicit slot save/restore still works.
-
-## Caching optimization notes
-
-### Generated responses are cacheable prefixes
-
-llama.cpp slot KV bins saved **after a stream completes** include the evaluated prompt tokens and the generated LLM response tokens that remain in the slot. The proxy uses this to create two logical cache entries when verification succeeds:
-
-| Node | Purpose |
-|---|---|
-| Prompt node | Safe fallback keyed by the incoming rendered prompt. |
-| Generated-response node | Longer prefix keyed by the verified prompt plus generated response tokens. |
-
-Both nodes can point at the same physical llama.cpp `.bin` file. The cache pruner accounts for shared bins once and only deletes a bin after the last referencing node is removed.
-
-This mainly speeds **prefill** on later requests whose rendered prompt starts with prior generated text. It is especially valuable for:
-
-- code-generation sessions where clients rewind, undo, fork, or split chat trees,
-- long model thoughts/reasoning traces,
-- long assistant responses that become part of the next request prefix.
-
-It is less valuable for tool workflows where most new tokens come from **tool output** that was neither prefilled nor generated by the model in the cached slot. Tool output sent by the client is cached normally only after a later request containing that tool result is processed.
 
 ## Manual Slot KV operations
 
