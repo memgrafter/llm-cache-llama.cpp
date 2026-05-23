@@ -143,6 +143,32 @@ class PrefixCacheTests(unittest.TestCase):
             self.assertTrue((cache_dir / parent["bin_file"]).exists())
             self.assertFalse((cache_dir / leaf["bin_file"]).exists())
 
+    def test_prune_uses_plain_lru_not_hits_or_size(self):
+        with tempfile.TemporaryDirectory() as d:
+            cache_dir = pathlib.Path(d)
+            cache = prefix_cache.PrefixCache(cache_dir)
+            cache.init()
+            old_hot = self._node([1], label="old-hot", bin_file="old-hot.bin")
+            new_cold = self._node([2], label="new-cold", bin_file="new-cold.bin")
+            old_hot["created_at"] = "2026-05-20T00:00:00Z"
+            old_hot["last_used"] = "2026-05-20T01:00:00Z"
+            old_hot["hits"] = 99
+            old_hot["size_bytes"] = 1
+            new_cold["created_at"] = "2026-05-20T00:00:00Z"
+            new_cold["last_used"] = "2026-05-20T02:00:00Z"
+            new_cold["hits"] = 0
+            new_cold["size_bytes"] = 999
+            (cache_dir / old_hot["bin_file"]).write_bytes(b"a")
+            (cache_dir / new_cold["bin_file"]).write_bytes(b"b")
+            cache.insert_node(old_hot)
+            cache.insert_node(new_cold)
+
+            removed = cache.prune(max_bytes=None, max_nodes=1, dry_run=False)
+
+            self.assertEqual([n["id"] for n in removed], [old_hot["id"]])
+            self.assertIsNone(cache.get_node(old_hot["id"]))
+            self.assertIsNotNone(cache.get_node(new_cold["id"]))
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

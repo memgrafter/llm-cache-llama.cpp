@@ -519,8 +519,7 @@ class PrefixCache:
                     WHERE c.id IS NULL AND n.pinned = 0
                     ORDER BY
                       COALESCE(n.last_used, n.created_at) ASC,
-                      n.hits ASC,
-                      n.size_bytes DESC
+                      n.id ASC
                     """
                 ).fetchall()
                 if not candidate_rows:
@@ -562,8 +561,7 @@ class PrefixCache:
                             "last_used": candidate.get("last_used"),
                             "sort_key": {
                                 "last_used_or_created_at": candidate.get("last_used") or candidate.get("created_at"),
-                                "hits": candidate.get("hits"),
-                                "size_bytes_desc": candidate.get("size_bytes"),
+                                "id": candidate.get("id"),
                             },
                         }
                     )
@@ -576,7 +574,7 @@ class PrefixCache:
                     json.dumps(
                         {
                             "selected_id": node["id"],
-                            "reason": "oldest unused leaf by COALESCE(last_used, created_at), then hits, then larger size",
+                            "reason": "least-recently-used unpinned leaf by COALESCE(last_used, created_at)",
                             "total_bytes": total_bytes,
                             "total_nodes": total_nodes,
                             "max_bytes": max_bytes,
