@@ -99,6 +99,10 @@ Useful environment overrides:
 | `ALIAS` | `qwen3.6-28b-reap-iq3xxs-turbo3-35k` | Model id exposed by `/v1/models`. |
 | `CACHE_DIR` | `~/.cache/llama.cpp-launch-scripts/slot-kv` | Slot KV save/restore directory. |
 | `CACHE_RAM` | `0` | Disables llama.cpp's separate multi-prompt RAM cache. |
+| `SPEC_TYPE` | `ngram-mod` | Enables draft-model-free speculative decoding; set `none` to disable. |
+| `SPEC_NGRAM_MOD_N_MATCH` | `24` | n-gram lookup length for `ngram-mod`. |
+| `SPEC_NGRAM_MOD_N_MIN` | `48` | Minimum n-gram draft length for `ngram-mod`. |
+| `SPEC_NGRAM_MOD_N_MAX` | `63` | Maximum n-gram draft length for `ngram-mod`; clamped to `BATCH - 1` because llama.cpp verifies one sampled token plus draft tokens in one logical batch. |
 | `RESTORE_SLOT_ON_START` | `slot_0_current.bin` | Static slot KV file to restore into llama.cpp before the proxy starts; set empty to skip. |
 | `RESTORE_SLOT_ID` | `0` | Slot id restored at startup. |
 | `TOP_K` | `3` | Legacy KV candidates the proxy may try per prompt. |
@@ -110,6 +114,8 @@ Useful environment overrides:
 | `NO_GENERATED_PREFIX_CACHE` | `0` | Set `1` to skip optimistic generated-response prefix nodes after stream completion. |
 | `ALLOW_EXACT_PREFIX_RESTORE` | `0` | Set `1` only after the llama.cpp exact-prefix restore crash is fixed. |
 | `STOP_EXISTING` | `1` | Clear existing listeners on the public/backend ports before launch. |
+
+Speculative decoding defaults to `ngram-mod` because it does not require a draft model and uses only a small shared n-gram hash pool; llama.cpp still verifies all drafted tokens with the main model.
 
 Example with logs and custom ports:
 

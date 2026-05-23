@@ -79,6 +79,26 @@ SLOT_SAVE_PATH="${SLOT_SAVE_PATH:-$HOME/.cache/llama.cpp-launch-scripts/slot-kv}
 CACHE_REUSE="${CACHE_REUSE:-256}"
 CACHE_RAM="${CACHE_RAM:-0}"
 
+# Speculative decoding. ngram-mod is draft-model-free and low-memory; the target model
+# still verifies all draft tokens. Set SPEC_TYPE=none to disable.
+SPEC_TYPE="${SPEC_TYPE:-ngram-mod}"
+SPEC_NGRAM_MOD_N_MATCH="${SPEC_NGRAM_MOD_N_MATCH:-24}"
+SPEC_NGRAM_MOD_N_MIN="${SPEC_NGRAM_MOD_N_MIN:-48}"
+SPEC_NGRAM_MOD_N_MAX="${SPEC_NGRAM_MOD_N_MAX:-63}"
+SPEC_NGRAM_MOD_N_MIN_EFFECTIVE="$SPEC_NGRAM_MOD_N_MIN"
+SPEC_NGRAM_MOD_N_MAX_EFFECTIVE="$SPEC_NGRAM_MOD_N_MAX"
+if [[ ",$SPEC_TYPE," == *,ngram-mod,* && "$BATCH" =~ ^[0-9]+$ && "$SPEC_NGRAM_MOD_N_MAX" =~ ^[0-9]+$ ]]; then
+  # llama-server verifies the sampled token plus draft tokens in one logical batch.
+  # Keep ngram-mod's draft length within BATCH-1 to avoid overflowing llama_batch.
+  spec_ngram_mod_batch_limit=$(( BATCH > 1 ? BATCH - 1 : 0 ))
+  if (( SPEC_NGRAM_MOD_N_MAX_EFFECTIVE > spec_ngram_mod_batch_limit )); then
+    SPEC_NGRAM_MOD_N_MAX_EFFECTIVE="$spec_ngram_mod_batch_limit"
+  fi
+  if [[ "$SPEC_NGRAM_MOD_N_MIN" =~ ^[0-9]+$ ]] && (( SPEC_NGRAM_MOD_N_MIN_EFFECTIVE > SPEC_NGRAM_MOD_N_MAX_EFFECTIVE )); then
+    SPEC_NGRAM_MOD_N_MIN_EFFECTIVE="$SPEC_NGRAM_MOD_N_MAX_EFFECTIVE"
+  fi
+fi
+
 # Runtime behavior.
 FLASH_ATTN="${FLASH_ATTN:-auto}"
 KV_OFFLOAD="${KV_OFFLOAD:-1}"
@@ -187,6 +207,15 @@ fi
 
 if [[ "$MTP" != "0" ]]; then
   args+=(--spec-type draft-mtp --spec-draft-n-max "$MTP" --spec-draft-n-min "$MTP")
+elif [[ -n "$SPEC_TYPE" && "$SPEC_TYPE" != "none" ]]; then
+  args+=(--spec-type "$SPEC_TYPE")
+  if [[ ",$SPEC_TYPE," == *,ngram-mod,* ]]; then
+    args+=(
+      --spec-ngram-mod-n-match "$SPEC_NGRAM_MOD_N_MATCH"
+      --spec-ngram-mod-n-min "$SPEC_NGRAM_MOD_N_MIN_EFFECTIVE"
+      --spec-ngram-mod-n-max "$SPEC_NGRAM_MOD_N_MAX_EFFECTIVE"
+    )
+  fi
 fi
 
 case "$FLASH_ATTN" in
@@ -231,10 +260,11 @@ echo "CTX=$CTX NPRED=$NPRED NGL=$NGL THREADS=$THREADS BATCH=$BATCH UBATCH=$UBATC
 echo "CACHE_K=$CACHE_K CACHE_V=$CACHE_V FLASH_ATTN=$FLASH_ATTN KV_OFFLOAD=$KV_OFFLOAD MLOCK=$MLock"
 echo "GGML_METAL_NO_RESIDENCY=$GGML_METAL_NO_RESIDENCY iogpu.wired_limit_mb=$(sysctl -n iogpu.wired_limit_mb 2>/dev/null || echo unknown)"
 if [[ "$SERVE" == "1" ]]; then
-  echo "SERVE=1 URL=http://$HOST:$PORT/v1 MODEL_ALIAS=$ALIAS PARALLEL=$PARALLEL MTP=$MTP SLOT_SAVE_PATH=${SLOT_SAVE_PATH:-<disabled>} CACHE_RAM=${CACHE_RAM:-<default>} CACHE_REUSE=$CACHE_REUSE"
+  echo "SERVE=1 URL=http://$HOST:$PORT/v1 MODEL_ALIAS=$ALIAS PARALLEL=$PARALLEL MTP=$MTP SPEC_TYPE=$SPEC_TYPE SLOT_SAVE_PATH=${SLOT_SAVE_PATH:-<disabled>} CACHE_RAM=${CACHE_RAM:-<default>} CACHE_REUSE=$CACHE_REUSE"
 else
   echo "CONVERSATION=$CONVERSATION SINGLE_TURN=$SINGLE_TURN SIMPLE_IO=$SIMPLE_IO DISPLAY_PROMPT=$DISPLAY_PROMPT PROMPT_FILE=${PROMPT_FILE:-<none>}"
 fi
+echo "SPEC_NGRAM_MOD_N_MATCH=$SPEC_NGRAM_MOD_N_MATCH SPEC_NGRAM_MOD_N_MIN=$SPEC_NGRAM_MOD_N_MIN_EFFECTIVE SPEC_NGRAM_MOD_N_MAX=$SPEC_NGRAM_MOD_N_MAX_EFFECTIVE"
 echo "TURBOQUANT=$TURBOQUANT TURBOQUANT_FLAGS=${TURBOQUANT_FLAGS:-<auto/implicit>} EXTRA_FLAGS=${EXTRA_FLAGS:-<none>}"
 echo
 
