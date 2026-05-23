@@ -105,7 +105,7 @@ Useful environment overrides:
 | `SPEC_NGRAM_MOD_N_MAX` | `63` | Maximum n-gram draft length for `ngram-mod`; clamped to `BATCH - 1` because llama.cpp verifies one sampled token plus draft tokens in one logical batch. |
 | `TOP_K` | `3` | Legacy KV candidates the proxy may try per prompt. |
 | `MIN_SAVE_TOKENS` | `256` | Minimum rendered-prompt token count before automatic prefix-cache autosave. |
-| `PREFIX_CACHE_MAX_BYTES` | `2GiB` | Trie-backed prefix-cache size limit; leaf nodes are pruned to stay under it. |
+| `PREFIX_CACHE_MAX_BYTES` | `4GiB` | Trie-backed prefix-cache size limit; leaf nodes are pruned to stay under it. |
 | `PREFIX_CACHE_MIN_FREE_BYTES` | `512MiB` | Minimum filesystem free space required before autosave; the proxy prunes or skips gracefully below it. |
 | `NO_AUTO_SAVE` | `0` | Set `1` to restore prefixes but skip automatic saves. |
 | `NO_PREFIX_CACHE` | `0` | Set `1` to disable trie-backed prefix cache. |
@@ -166,7 +166,7 @@ python3 lmcache-proxy-on-demand.py \
   --cache-dir ~/.cache/llama.cpp-launch-scripts/slot-kv \
   --top-k 3 \
   --min-save-tokens 256 \
-  --prefix-cache-max-bytes 2GiB \
+  --prefix-cache-max-bytes 4GiB \
   --prefix-cache-min-free-bytes 512MiB
 ```
 
