@@ -320,9 +320,17 @@ class LMCacheHandler(BaseHTTPRequestHandler):
         log.warning("unknown anchor side %r for %s", cfg.side, cfg.label)
         return None
 
-    def _anchors_for_prompt(self, prompt_text: str) -> list[RequestAnchor]:
+    def _anchors_for_prompt(self, path: str, body: dict, prompt_text: str) -> list[RequestAnchor]:
         anchors: list[RequestAnchor] = []
+        messages = body.get("messages") if isinstance(body, dict) else None
+        first_role = None
+        if path.startswith("/v1/chat/completions") or path.startswith("/chat/completions"):
+            if isinstance(messages, list) and messages and isinstance(messages[0], dict):
+                first_role = str(messages[0].get("role") or "")
+
         for cfg in self.anchor_configs:
+            if cfg.label == "end-of-system-message" and first_role not in ("system", "developer"):
+                continue
             end = self._find_marker_boundary(prompt_text, cfg)
             if end is None or end <= 0:
                 continue
@@ -342,7 +350,7 @@ class LMCacheHandler(BaseHTTPRequestHandler):
         tokens = self._tokenize(prompt_text)
         if not tokens:
             return None
-        anchors = self._anchors_for_prompt(prompt_text)
+        anchors = self._anchors_for_prompt(path, body, prompt_text)
         return RequestCacheContext(prompt_text=prompt_text, prompt_tokens=tokens, anchors=anchors)
 
     def _materialize_anchor_once(self, anchor: RequestAnchor) -> dict | None:
@@ -418,7 +426,12 @@ class LMCacheHandler(BaseHTTPRequestHandler):
             "created_at": prefix_cache.utc_now(),
             "last_used": None,
             "pinned": anchor.config.pinned,
-            "meta": {"source": "lmcache-proxy-on-demand", "prefill_response": prefill},
+            "meta": {
+                "source": "lmcache-proxy-on-demand",
+                "prefill_response": prefill,
+                "anchor_text": anchor.text,
+                "anchor_tokens": anchor.tokens,
+            },
         }
         cache.insert_node(node)
         cache.insert_anchor({
@@ -432,7 +445,11 @@ class LMCacheHandler(BaseHTTPRequestHandler):
             "side": anchor.config.side,
             "pinned": anchor.config.pinned,
             "created_at": prefix_cache.utc_now(),
-            "meta": {"materialized": True},
+            "meta": {
+                "materialized": True,
+                "anchor_text": anchor.text,
+                "anchor_tokens": anchor.tokens,
+            },
         })
         log.info("prefix-cache materialized anchor node %s (%d tokens, %.1f MiB)", node_id, len(anchor.tokens), size_bytes / MIB)
         return cache.get_node(node_id)
@@ -819,7 +836,11 @@ class LMCacheHandler(BaseHTTPRequestHandler):
                     "side": anchor.config.side,
                     "pinned": anchor.config.pinned,
                     "created_at": prefix_cache.utc_now(),
-                    "meta": {"anchor_id": anchor_id},
+                    "meta": {
+                        "anchor_id": anchor_id,
+                        "anchor_text": anchor.text,
+                        "anchor_tokens": anchor.tokens,
+                    },
                 })
 
         if generated_tokens is not None and generated_node_id is not None and generated_digest is not None and not generated_exists:

@@ -582,7 +582,10 @@ class LMCacheProxyOnDemandTests(unittest.TestCase):
             cache = prefix_cache.PrefixCache(pathlib.Path(cache_dir_str))
             cache.init()
             body = {
-                "messages": [{"role": "user", "content": "hello"}],
+                "messages": [
+                    {"role": "system", "content": "shared instructions"},
+                    {"role": "user", "content": "hello"},
+                ],
                 "tools": [{"type": "function", "function": {"name": "noop", "parameters": {"type": "object"}}}],
                 "tool_choice": "auto",
                 "stream": True,
@@ -649,6 +652,9 @@ class LMCacheProxyOnDemandTests(unittest.TestCase):
             self.assertIsNotNone(anchor_match)
             self.assertEqual(anchor_match["boundary"], "anchor")
             self.assertEqual(anchor_match["token_count"], len(anchor_tokens))
+            anchor_meta = json.loads(anchor_match["meta_json"])
+            self.assertEqual(anchor_meta["anchor_text"], "<|im_start|>system\nshared instructions<|im_end|>")
+            self.assertEqual(anchor_meta["anchor_tokens"], anchor_tokens)
 
     def test_prefix_cache_anchor_materializes_once_after_full_prefix_miss(self):
         with tempfile.TemporaryDirectory() as cache_dir_str:
@@ -687,7 +693,10 @@ class LMCacheProxyOnDemandTests(unittest.TestCase):
                 "created_at": prefix_cache.utc_now(),
             })
 
-            handler, body_bytes = self._make_handler({"messages": [{"role": "user", "content": "new"}]}, path="/v1/chat/completions")
+            handler, body_bytes = self._make_handler({"messages": [
+                {"role": "system", "content": "shared"},
+                {"role": "user", "content": "new"},
+            ]}, path="/v1/chat/completions")
             handler._forward = mock.Mock(return_value=lmcache.ForwardResult(200, "text/event-stream", b""))
             handler.prefix_cache_obj = cache
             handler.cache_dir_obj = None
@@ -726,6 +735,9 @@ class LMCacheProxyOnDemandTests(unittest.TestCase):
             self.assertIsNotNone(materialized)
             self.assertEqual(materialized["boundary"], "anchor")
             self.assertEqual(materialized["token_count"], len(anchor_tokens))
+            materialized_meta = json.loads(materialized["meta_json"])
+            self.assertEqual(materialized_meta["anchor_text"], anchor_text)
+            self.assertEqual(materialized_meta["anchor_tokens"], anchor_tokens)
             handler._forward.assert_called_once_with("POST", "/v1/chat/completions", body_bytes)
 
     def test_prefix_cache_restores_existing_materialized_anchor(self):
@@ -764,7 +776,10 @@ class LMCacheProxyOnDemandTests(unittest.TestCase):
                 "created_at": prefix_cache.utc_now(),
             })
 
-            handler, body_bytes = self._make_handler({"messages": [{"role": "user", "content": "new"}]}, path="/v1/chat/completions")
+            handler, body_bytes = self._make_handler({"messages": [
+                {"role": "system", "content": "shared"},
+                {"role": "user", "content": "new"},
+            ]}, path="/v1/chat/completions")
             handler._forward = mock.Mock(return_value=lmcache.ForwardResult(200, "text/event-stream", b""))
             handler.prefix_cache_obj = cache
             handler.cache_dir_obj = None
