@@ -19,6 +19,21 @@ A 28B parameter model needs ~56 GB of RAM at FP16 to load. On a 16 GB machine th
 
 **Speculative decoding via ngram-mod.** No draft model needed — it uses a shared n-gram hash pool to draft tokens from repeated code/text patterns. llama.cpp still verifies all drafted tokens with the main model, so correctness isn't compromised. It's low-memory and works well for coding workloads where the same code blocks repeat across requests.
 
+## Expected speed
+
+Representative `logs/` runs on the 16 GB M4 Mac Mini with this IQ3 model are all in the same ballpark. Prefill here means new prompt tokens after restoring the closest disk checkpoint.
+
+| Checkpoint context | Prefill | Generation |
+| --- | ---: | ---: |
+| ~3k tokens | ~84-92 t/s | ~28-29 t/s |
+| ~5-7k tokens | ~72-82 t/s | ~26-28 t/s |
+| ~13k tokens | ~55-57 t/s | ~22-23 t/s |
+| ~19-22k tokens | ~37-46 t/s | ~19-21 t/s |
+| ~24-30k tokens | ~24-36 t/s | ~16-18 t/s |
+| ~32-33k tokens | ~26-28 t/s | ~15-16 t/s |
+
+Best-case speculative generation with `ngram-mod` hit about **36-37 t/s** when the output had reusable repeated patterns. Treat that as an upside case; normal generation is closer to the table.
+
 **Prefix trie on disk.** Instead of keeping prompts in RAM, the proxy hashes each prompt with BLAKE2b-128, stores the prefix node metadata in SQLite, and saves KV state as `.bin` files on disk. On the next request, it restores whatever prefix matches best from disk. Generated responses are also cached — rewinding a code session reuses previously generated tokens instead of regenerating them.
 
 
