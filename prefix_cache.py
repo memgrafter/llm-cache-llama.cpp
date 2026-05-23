@@ -18,6 +18,7 @@ import contextlib
 import datetime as _dt
 import hashlib
 import json
+import logging
 import os
 import pathlib
 import sqlite3
@@ -32,6 +33,7 @@ DEFAULT_CACHE_DIR = pathlib.Path("~/.cache/llama.cpp-launch-scripts/slot-kv").ex
 DEFAULT_BASE_URL = "http://127.0.0.1:8081"
 HASH_ALGO = "blake2b-128-le-u32-v1"
 _PACK_U32 = struct.Struct("<I")
+log = logging.getLogger(__name__)
 
 
 def utc_now() -> str:
@@ -507,21 +509,86 @@ class PrefixCache:
                 if not over_bytes and not over_nodes:
                     break
 
-                row = db.execute(
+                candidate_rows = db.execute(
                     """
-                    SELECT n.* FROM nodes n
+                    SELECT
+                      n.*,
+                      (SELECT COUNT(*) FROM nodes r WHERE r.bin_file = n.bin_file) AS bin_refs
+                    FROM nodes n
                     LEFT JOIN nodes c ON c.parent_id = n.id
                     WHERE c.id IS NULL AND n.pinned = 0
                     ORDER BY
                       COALESCE(n.last_used, n.created_at) ASC,
                       n.hits ASC,
                       n.size_bytes DESC
-                    LIMIT 1
                     """
-                ).fetchone()
-                if not row:
+                ).fetchall()
+                if not candidate_rows:
+                    log.warning(
+                        "prefix-cache prune wanted but found no removable leaf nodes: %s",
+                        json.dumps(
+                            {
+                                "total_bytes": total_bytes,
+                                "total_nodes": total_nodes,
+                                "max_bytes": max_bytes,
+                                "max_nodes": max_nodes,
+                                "over_bytes": over_bytes,
+                                "over_nodes": over_nodes,
+                                "dry_run": dry_run,
+                                "candidates": [],
+                            },
+                            sort_keys=True,
+                        ),
+                    )
                     break
+                decision_data = []
+                for rank, r in enumerate(candidate_rows, 1):
+                    candidate = dict(r)
+                    decision_data.append(
+                        {
+                            "rank": rank,
+                            "selected": rank == 1,
+                            "id": candidate["id"],
+                            "boundary": candidate.get("boundary"),
+                            "label": candidate.get("label"),
+                            "token_count": candidate.get("token_count"),
+                            "parent_id": candidate.get("parent_id"),
+                            "bin_file": candidate.get("bin_file"),
+                            "bin_refs": candidate.get("bin_refs"),
+                            "would_unlink_bin": int(candidate.get("bin_refs") or 0) <= 1,
+                            "size_bytes": candidate.get("size_bytes"),
+                            "hits": candidate.get("hits"),
+                            "created_at": candidate.get("created_at"),
+                            "last_used": candidate.get("last_used"),
+                            "sort_key": {
+                                "last_used_or_created_at": candidate.get("last_used") or candidate.get("created_at"),
+                                "hits": candidate.get("hits"),
+                                "size_bytes_desc": candidate.get("size_bytes"),
+                            },
+                        }
+                    )
+                row = candidate_rows[0]
                 node = dict(row)
+                node.pop("bin_refs", None)
+                log.info(
+                    "prefix-cache prune selected %s: %s",
+                    node["id"],
+                    json.dumps(
+                        {
+                            "selected_id": node["id"],
+                            "reason": "oldest unused leaf by COALESCE(last_used, created_at), then hits, then larger size",
+                            "total_bytes": total_bytes,
+                            "total_nodes": total_nodes,
+                            "max_bytes": max_bytes,
+                            "max_nodes": max_nodes,
+                            "over_bytes": over_bytes,
+                            "over_nodes": over_nodes,
+                            "dry_run": dry_run,
+                            "candidates": decision_data,
+                        },
+                        sort_keys=True,
+                    ),
+                )
                 removed.append(node)
                 if dry_run:
                     # Simulate only one candidate in dry-run to avoid fake totals.
