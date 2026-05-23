@@ -237,11 +237,6 @@ class TestPrefixCacheIntegrationLive(PrefixCacheIntegrationContract, unittest.Te
                 with contextlib.closing(cache.connect()) as db:
                     db.execute("DELETE FROM nodes WHERE id = ?", (node_id,))
                     db.commit()
-        # Put the normal static slot back if available.
-        try:
-            prefix_cache.LlamaClient(self.base_url).restore_slot(0, "slot_0_current.bin")
-        except Exception:
-            pass
 
 
 if __name__ == "__main__":

@@ -40,8 +40,6 @@ NO_AUTO_SAVE="${NO_AUTO_SAVE:-0}"
 NO_PREFIX_CACHE="${NO_PREFIX_CACHE:-0}"
 NO_GENERATED_PREFIX_CACHE="${NO_GENERATED_PREFIX_CACHE:-0}"
 ALLOW_EXACT_PREFIX_RESTORE="${ALLOW_EXACT_PREFIX_RESTORE:-0}"
-RESTORE_SLOT_ON_START="${RESTORE_SLOT_ON_START:-slot_0_current.bin}"
-RESTORE_SLOT_ID="${RESTORE_SLOT_ID:-0}"
 STOP_EXISTING="${STOP_EXISTING:-1}"
 STARTUP_TIMEOUT="${STARTUP_TIMEOUT:-180}"
 
@@ -165,14 +163,7 @@ for i in $(seq 1 "$STARTUP_TIMEOUT"); do
   sleep 1
 done
 
-if [[ -n "$RESTORE_SLOT_ON_START" ]]; then
-  echo "Restoring slot $RESTORE_SLOT_ID from $RESTORE_SLOT_ON_START"
-  curl -sS --max-time 180 \
-    -X POST "http://$BACKEND_HOST:$BACKEND_PORT/slots/$RESTORE_SLOT_ID?action=restore" \
-    -H 'Content-Type: application/json' \
-    -d "{\"filename\":\"$RESTORE_SLOT_ON_START\"}"
-  echo
-fi
+echo "Backend slot starts empty; prefix cache restore happens on the first proxied request."
 
 echo "Starting LMCache proxy on $PUBLIC_HOST:$PUBLIC_PORT -> $BACKEND_HOST:$BACKEND_PORT"
 echo "Proxy log: $PROXY_LOG"
