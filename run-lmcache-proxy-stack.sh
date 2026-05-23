@@ -45,7 +45,7 @@ STARTUP_TIMEOUT="${STARTUP_TIMEOUT:-180}"
 
 # Model/backend defaults for this stack. Override with env vars as needed.
 export GGML_METAL_NO_RESIDENCY="${GGML_METAL_NO_RESIDENCY:-1}"
-export CTX="${CTX:-32768}"
+export CTX="${CTX:-35000}"
 export NGL="${NGL:-999}"
 export BATCH="${BATCH:-64}"
 export UBATCH="${UBATCH:-16}"
