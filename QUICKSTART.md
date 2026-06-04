@@ -17,7 +17,7 @@ A 28B parameter model needs ~56 GB of RAM at FP16 to load. On a 16 GB machine th
 - The proxy restores the best matching prefix from disk on the next request
 - No more OOM crashes from competing prompts fighting for Metal memory
 
-**Use an IQ3-quantized model.** [Qwen3.6-28B-REAP.i1-IQ3_XXS.gguf](https://huggingface.co/mradermacher/Qwen3.6-28B-REAP-i1-GGUF?show_file_info=Qwen3.6-28B-REAP.i1-IQ3_XXS.gguf) is an intermediate-quant variant from the TurboQuant build path — smaller than full FP16 but still retains enough quality for coding/reasoning workloads. The TurboQuant build (`llama-cpp-turboquant-build-metal`) includes IQ3 kernel support that makes this quantization actually usable on Metal.
+**Use an IQ3-quantized model.** [Qwen3.6-28B-REAP.i1-IQ3_XXS.gguf](https://huggingface.co/mradermacher/Qwen3.6-28B-REAP-i1-GGUF?show_file_info=Qwen3.6-28B-REAP.i1-IQ3_XXS.gguf) 
 
 **Speculative decoding via ngram-mod.** No draft model needed — it uses a shared n-gram hash pool to draft tokens from repeated code/text patterns. llama.cpp still verifies all drafted tokens with the main model, so correctness isn't compromised. It's low-memory and works well for coding workloads where the same code blocks repeat across requests.
 
