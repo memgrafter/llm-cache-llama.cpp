@@ -72,7 +72,7 @@ CACHE_V="${CACHE_V:-turbo3}"
 # Server knobs.
 HOST="${HOST:-127.0.0.1}"
 PORT="${PORT:-8081}"
-ALIAS="${ALIAS:-qwen3.6-28b-reap-iq3xxs-turbo3-35k}"
+ALIAS="${ALIAS:-local-model}"
 PARALLEL="${PARALLEL:-1}"
 MTP="${MTP:-0}"
 SLOT_SAVE_PATH="${SLOT_SAVE_PATH:-$HOME/.cache/llama.cpp-launch-scripts/slot-kv}"
