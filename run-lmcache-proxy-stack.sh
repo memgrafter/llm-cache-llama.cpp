@@ -57,6 +57,7 @@ export PORT="$BACKEND_PORT"
 export ALIAS="${ALIAS:-qwen3.6-28b-reap-iq3xxs-turbo3-35k}"
 export SLOT_SAVE_PATH="$CACHE_DIR"
 export CACHE_RAM="${CACHE_RAM:-0}"
+export BACKEND_SCRIPT="${BACKEND_SCRIPT:-run-qwen36-reap.sh}"
 
 LOG_DIR="${LOG_DIR:-$SCRIPT_DIR/logs}"
 mkdir -p "$LOG_DIR" "$CACHE_DIR"
@@ -139,9 +140,9 @@ if lsof -tiTCP:"$PUBLIC_PORT" -sTCP:LISTEN >/dev/null 2>&1 || \
   exit 1
 fi
 
-echo "Starting llama.cpp backend on $BACKEND_HOST:$BACKEND_PORT"
+echo "Starting llama.cpp backend on $BACKEND_HOST:$BACKEND_PORT (via $BACKEND_SCRIPT)"
 echo "Backend log: $BACKEND_LOG"
-./run-qwen36-reap.sh --serve > "$BACKEND_LOG" 2>&1 &
+./"$BACKEND_SCRIPT" --serve > "$BACKEND_LOG" 2>&1 &
 backend_pid=$!
 echo "$backend_pid" > "$BACKEND_PID_FILE"
 

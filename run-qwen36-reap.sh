@@ -60,7 +60,7 @@ else
 fi
 
 # Context/memory knobs.
-CTX="${CTX:-4096}"
+CTX="${CTX:-60000}"
 NPRED="${NPRED:-8192}"
 NGL="${NGL:-999}"
 THREADS="${THREADS:-$(sysctl -n hw.perflevel0.physicalcpu 2>/dev/null || sysctl -n hw.physicalcpu 2>/dev/null || echo 8)}"
