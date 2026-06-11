@@ -54,7 +54,7 @@ Get `Qwen3.6-28B-REAP.i1-IQ3_XXS.gguf` from:
 
 https://huggingface.co/mradermacher/Qwen3.6-28B-REAP-i1-GGUF?show_file_info=Qwen3.6-28B-REAP.i1-IQ3_XXS.gguf
 
-Place it at the default location or override with `MODEL=/path/to/model.gguf`.
+Place it under the repo `models/` directory, or override with `MODEL=/path/to/model.gguf`.
 
 ### Build the TurboQuant llama.cpp binary
 

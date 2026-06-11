@@ -15,26 +15,35 @@ if [[ "${1:-}" == "--serve" ]]; then
 fi
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+export MODELS_DIR="${MODELS_DIR:-$SCRIPT_DIR/models}"
 LLAMA_DIR="${LLAMA_DIR:-$HOME/clones/llama.cpp}"
 LOCAL_TURBO_BUILD="${LOCAL_TURBO_BUILD:-$SCRIPT_DIR/builds/llama-cpp-turboquant-build-metal}"
 LOCAL_B9222_BUILD="${LOCAL_B9222_BUILD:-$SCRIPT_DIR/builds/llama-b9222}"
-MODEL="${MODEL:-$HOME/Downloads/Qwen3.6-28B-REAP.i1-IQ3_XXS.gguf}"
-# MODEL="${MODEL:-$HOME/Downloads/Qwen3.6-28B-REAP.i1-IQ3_M.gguf}"
+MODEL="${MODEL:-$MODELS_DIR/Qwen3.6-28B-REAP.i1-IQ3_XXS.gguf}"
+# MODEL="${MODEL:-$MODELS_DIR/Qwen3.6-28B-REAP.i1-IQ3_M.gguf}"
 export GGML_METAL_NO_RESIDENCY="${GGML_METAL_NO_RESIDENCY:-1}"
 
+is_runnable_llama_bin() {
+  local candidate="$1"
+  [[ -x "$candidate" ]] && "$candidate" --version >/dev/null 2>&1
+}
+
 # Binary autodetect. Override with BIN=/path/to/llama-cli or SERVER_BIN=/path/to/llama-server if needed.
+# Use --version as a cheap smoke test so Linux skips checked-in macOS arm64 binaries.
 if [[ "$SERVE" == "1" ]]; then
   if [[ -n "${SERVER_BIN:-}" ]]; then
     BIN="$SERVER_BIN"
-  elif [[ -x "$LOCAL_TURBO_BUILD/bin/llama-server" ]]; then
+  elif [[ "$(uname -s)" == "Linux" ]] && command -v llama-server >/dev/null 2>&1 && is_runnable_llama_bin "$(command -v llama-server)"; then
+    BIN="$(command -v llama-server)"
+  elif is_runnable_llama_bin "$LOCAL_TURBO_BUILD/bin/llama-server"; then
     BIN="$LOCAL_TURBO_BUILD/bin/llama-server"
-  elif [[ -x "$LOCAL_B9222_BUILD/llama-server" ]]; then
+  elif is_runnable_llama_bin "$LOCAL_B9222_BUILD/llama-server"; then
     BIN="$LOCAL_B9222_BUILD/llama-server"
-  elif [[ -x "$HOME/clones/llama-cpp-turboquant/build-metal/bin/llama-server" ]]; then
+  elif is_runnable_llama_bin "$HOME/clones/llama-cpp-turboquant/build-metal/bin/llama-server"; then
     BIN="$HOME/clones/llama-cpp-turboquant/build-metal/bin/llama-server"
-  elif [[ -x "$LLAMA_DIR/build/bin/llama-server" ]]; then
+  elif is_runnable_llama_bin "$LLAMA_DIR/build/bin/llama-server"; then
     BIN="$LLAMA_DIR/build/bin/llama-server"
-  elif command -v llama-server >/dev/null 2>&1; then
+  elif command -v llama-server >/dev/null 2>&1 && is_runnable_llama_bin "$(command -v llama-server)"; then
     BIN="$(command -v llama-server)"
   else
     BIN="./llama-server"
@@ -42,17 +51,19 @@ if [[ "$SERVE" == "1" ]]; then
 else
   if [[ -n "${BIN:-}" ]]; then
     :
-  elif [[ -x "$LOCAL_TURBO_BUILD/bin/llama-cli" ]]; then
+  elif [[ "$(uname -s)" == "Linux" ]] && command -v llama-cli >/dev/null 2>&1 && is_runnable_llama_bin "$(command -v llama-cli)"; then
+    BIN="$(command -v llama-cli)"
+  elif is_runnable_llama_bin "$LOCAL_TURBO_BUILD/bin/llama-cli"; then
     BIN="$LOCAL_TURBO_BUILD/bin/llama-cli"
-  elif [[ -x "$LOCAL_B9222_BUILD/llama-cli" ]]; then
+  elif is_runnable_llama_bin "$LOCAL_B9222_BUILD/llama-cli"; then
     BIN="$LOCAL_B9222_BUILD/llama-cli"
-  elif [[ -x "./llama-cli" ]]; then
+  elif is_runnable_llama_bin "./llama-cli"; then
     BIN="./llama-cli"
-  elif [[ -x "$LLAMA_DIR/build/bin/llama-cli" ]]; then
+  elif is_runnable_llama_bin "$LLAMA_DIR/build/bin/llama-cli"; then
     BIN="$LLAMA_DIR/build/bin/llama-cli"
-  elif [[ -x "$LLAMA_DIR/build/bin/main" ]]; then
+  elif is_runnable_llama_bin "$LLAMA_DIR/build/bin/main"; then
     BIN="$LLAMA_DIR/build/bin/main"
-  elif command -v llama-cli >/dev/null 2>&1; then
+  elif command -v llama-cli >/dev/null 2>&1 && is_runnable_llama_bin "$(command -v llama-cli)"; then
     BIN="$(command -v llama-cli)"
   else
     BIN="./llama-cli"
@@ -66,8 +77,14 @@ NGL="${NGL:-999}"
 THREADS="${THREADS:-$(sysctl -n hw.perflevel0.physicalcpu 2>/dev/null || sysctl -n hw.physicalcpu 2>/dev/null || echo 8)}"
 BATCH="${BATCH:-64}"
 UBATCH="${UBATCH:-16}"
-CACHE_K="${CACHE_K:-q8_0}"
-CACHE_V="${CACHE_V:-turbo3}"
+if [[ "$(uname -s)" == "Linux" ]]; then
+  # Mainline CUDA llama.cpp does not support TurboQuant's turbo3 KV cache type.
+  CACHE_K="${CACHE_K:-q8_0}"
+  CACHE_V="${CACHE_V:-q8_0}"
+else
+  CACHE_K="${CACHE_K:-q8_0}"
+  CACHE_V="${CACHE_V:-turbo3}"
+fi
 
 # Server knobs.
 HOST="${HOST:-127.0.0.1}"

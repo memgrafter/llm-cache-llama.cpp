@@ -58,6 +58,8 @@ When the supervisor/proxy stops, it also stops the llama.cpp backend.
 | `BACKEND_HOST` | `127.0.0.1` | llama.cpp backend host. |
 | `BACKEND_PORT` | `8082` | Private llama.cpp backend port. |
 | `ALIAS` | `qwen3.6-28b-reap-iq3xxs-turbo3-35k` | Model id exposed by `/v1/models`. |
+| `MODELS_DIR` | `<repo>/models` | Directory used by model wrapper scripts for GGUF defaults. |
+| `MODEL` | wrapper-specific GGUF in `MODELS_DIR` | Exact GGUF path passed to llama.cpp. |
 | `CACHE_DIR` | `~/.cache/llama.cpp-launch-scripts/slot-kv` | Slot KV save/restore directory. |
 | `CACHE_RAM` | `0` | Disables llama.cpp's separate multi-prompt RAM cache. |
 | `SPEC_TYPE` | `ngram-mod` | Enables draft-model-free speculative decoding; set `none` to disable. |

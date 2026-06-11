@@ -42,6 +42,8 @@ Launches llama.cpp directly. In the supervised proxy stack, this is called by `r
 Important defaults:
 
 ```text
+MODELS_DIR=<repo>/models
+MODEL=$MODELS_DIR/Qwen3.6-28B-REAP.i1-IQ3_XXS.gguf
 ALIAS=qwen3.6-28b-reap-iq3xxs-turbo3-35k
 SLOT_SAVE_PATH=~/.cache/llama.cpp-launch-scripts/slot-kv
 CACHE_RAM=0

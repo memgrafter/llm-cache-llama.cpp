@@ -2,8 +2,9 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+export MODELS_DIR="${MODELS_DIR:-$SCRIPT_DIR/models}"
 
-export MODEL="${MODEL:-$HOME/Downloads/Qwen3.6-35B-A3B-UD-IQ2_M.gguf}"
+export MODEL="${MODEL:-$MODELS_DIR/Qwen3.6-35B-A3B-UD-IQ2_M.gguf}"
 export ALIAS="${ALIAS:-local-model}"
 export CACHE_DIR="${CACHE_DIR:-$HOME/.cache/llama.cpp-launch-scripts/qwen36-35b-a3b-ud-iq2m}"
 export CTX="${CTX:-60000}"

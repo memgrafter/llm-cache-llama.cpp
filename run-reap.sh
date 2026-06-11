@@ -2,8 +2,9 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+export MODELS_DIR="${MODELS_DIR:-$SCRIPT_DIR/models}"
 
-export MODEL="${MODEL:-$HOME/Downloads/Qwen3.6-28B-REAP.i1-IQ3_XXS.gguf}"
+export MODEL="${MODEL:-$MODELS_DIR/Qwen3.6-28B-REAP.i1-IQ3_XXS.gguf}"
 export ALIAS="${ALIAS:-local-model}"
 export CACHE_DIR="${CACHE_DIR:-$HOME/.cache/llama.cpp-launch-scripts/reap-iq3xxs}"
 export CTX="${CTX:-60000}"
