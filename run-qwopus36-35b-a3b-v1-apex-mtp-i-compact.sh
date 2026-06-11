@@ -8,6 +8,8 @@ export MODEL="${MODEL:-$MODELS_DIR/Qwopus3.6-35B-A3B-v1-APEX-MTP-I-Compact.gguf}
 export ALIAS="${ALIAS:-local-model}"
 export CACHE_DIR="${CACHE_DIR:-$HOME/.cache/llama.cpp-launch-scripts/qwopus36-35b-a3b-v1-apex-mtp-i-compact}"
 export CTX="${CTX:-160000}"
+export BATCH="${BATCH:-4096}"
+export UBATCH="${UBATCH:-1024}"
 if [[ "$(uname -s)" == "Linux" ]]; then
   # Mainline CUDA llama.cpp does not support TurboQuant's turbo3 KV cache type.
   export CACHE_K="${CACHE_K:-q8_0}"

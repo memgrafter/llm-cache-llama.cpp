@@ -75,8 +75,8 @@ CTX="${CTX:-60000}"
 NPRED="${NPRED:-8192}"
 NGL="${NGL:-999}"
 THREADS="${THREADS:-$(sysctl -n hw.perflevel0.physicalcpu 2>/dev/null || sysctl -n hw.physicalcpu 2>/dev/null || echo 8)}"
-BATCH="${BATCH:-64}"
-UBATCH="${UBATCH:-16}"
+BATCH="${BATCH:-4096}"
+UBATCH="${UBATCH:-1024}"
 if [[ "$(uname -s)" == "Linux" ]]; then
   # Mainline CUDA llama.cpp does not support TurboQuant's turbo3 KV cache type.
   CACHE_K="${CACHE_K:-q8_0}"

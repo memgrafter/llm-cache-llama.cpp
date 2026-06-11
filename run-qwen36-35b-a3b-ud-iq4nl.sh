@@ -4,10 +4,10 @@ set -euo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 export MODELS_DIR="${MODELS_DIR:-$SCRIPT_DIR/models}"
 
-export MODEL="${MODEL:-$MODELS_DIR/Qwopus3.6-35B-A3B-v1-MTP-Q4_K_M.gguf}"
+export MODEL="${MODEL:-$MODELS_DIR/Qwen3.6-35B-A3B-UD-IQ4_NL.gguf}"
 export ALIAS="${ALIAS:-local-model}"
-export CACHE_DIR="${CACHE_DIR:-$HOME/.cache/llama.cpp-launch-scripts/qwopus36-35b-a3b-v1-mtp-q4km}"
-export CTX="${CTX:-128000}"
+export CACHE_DIR="${CACHE_DIR:-$HOME/.cache/llama.cpp-launch-scripts/qwen36-35b-a3b-ud-iq4nl}"
+export CTX="${CTX:-160000}"
 export BATCH="${BATCH:-4096}"
 export UBATCH="${UBATCH:-1024}"
 if [[ "$(uname -s)" == "Linux" ]]; then
@@ -18,7 +18,7 @@ else
   export CACHE_K="${CACHE_K:-turbo3}"
   export CACHE_V="${CACHE_V:-turbo3}"
 fi
-export SPEC_TYPE="${SPEC_TYPE:-none}"
+export SPEC_TYPE="${SPEC_TYPE:-ngram-mod}"
 export MTP="${MTP:-2}"
 export EXTRA_FLAGS="${EXTRA_FLAGS:---no-mmproj}"
 
