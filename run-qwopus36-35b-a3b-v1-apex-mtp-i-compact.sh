@@ -19,7 +19,7 @@ else
   export CACHE_V="${CACHE_V:-turbo3}"
 fi
 export SPEC_TYPE="${SPEC_TYPE:-none}"
-export MTP="${MTP:-2}"
+export MTP="${MTP:-3}"
 export EXTRA_FLAGS="${EXTRA_FLAGS:---no-mmproj}"
 
 exec "$SCRIPT_DIR/run-lmcache-proxy-stack.sh" "$@"
