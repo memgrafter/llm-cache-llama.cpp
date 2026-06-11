@@ -11,6 +11,7 @@ import hashlib
 import json
 import copy
 import logging
+import os
 import pathlib
 import shutil
 import time
@@ -201,7 +202,7 @@ class LMCacheHandler(BaseHTTPRequestHandler):
 
         collected = bytearray()
         try:
-            with urllib.request.urlopen(req, timeout=600) as resp:
+            with urllib.request.urlopen(req, timeout=int(os.environ.get("LLAMA_FORWARD_TIMEOUT", "600"))) as resp:
                 content_type = resp.headers.get("Content-Type", "")
                 self.send_response(resp.status, resp.reason)
                 for key in resp.headers.keys():
