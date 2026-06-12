@@ -5,7 +5,7 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 export MODELS_DIR="${MODELS_DIR:-$SCRIPT_DIR/models}"
 
 export MODEL="${MODEL:-$MODELS_DIR/Qwen3.6-35B-A3B-UD-IQ4_NL.gguf}"
-export ALIAS="${ALIAS:-local-model}"
+export ALIAS="${ALIAS:-local-model,Qwen3.6-35B-A3B-UD-IQ4_NL}"
 export CACHE_DIR="${CACHE_DIR:-$HOME/.cache/llama.cpp-launch-scripts/qwen36-35b-a3b-ud-iq4nl}"
 export CTX="${CTX:-160000}"
 export BATCH="${BATCH:-4096}"

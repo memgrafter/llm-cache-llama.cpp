@@ -89,7 +89,7 @@ fi
 # Server knobs.
 HOST="${HOST:-127.0.0.1}"
 PORT="${PORT:-8081}"
-ALIAS="${ALIAS:-local-model}"
+ALIAS="${ALIAS:-local-model,Qwen3.6-28B-REAP.i1-IQ3_XXS}"
 PARALLEL="${PARALLEL:-1}"
 MTP="${MTP:-0}"
 REASONING="${REASONING:-on}"

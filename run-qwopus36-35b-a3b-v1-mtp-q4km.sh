@@ -5,7 +5,7 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 export MODELS_DIR="${MODELS_DIR:-$SCRIPT_DIR/models}"
 
 export MODEL="${MODEL:-$MODELS_DIR/Qwopus3.6-35B-A3B-v1-MTP-Q4_K_M.gguf}"
-export ALIAS="${ALIAS:-local-model}"
+export ALIAS="${ALIAS:-local-model,Qwopus3.6-35B-A3B-v1-MTP-Q4_K_M}"
 export CACHE_DIR="${CACHE_DIR:-$HOME/.cache/llama.cpp-launch-scripts/qwopus36-35b-a3b-v1-mtp-q4km}"
 export CTX="${CTX:-128000}"
 export BATCH="${BATCH:-4096}"

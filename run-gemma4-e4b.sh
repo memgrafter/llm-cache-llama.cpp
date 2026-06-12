@@ -5,7 +5,7 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 export MODELS_DIR="${MODELS_DIR:-$SCRIPT_DIR/models}"
 
 export MODEL="${MODEL:-$MODELS_DIR/gemma-4-E4B-it-qat-UD-Q4_K_XL.gguf}"
-export ALIAS="${ALIAS:-local-model}"
+export ALIAS="${ALIAS:-local-model,gemma-4-E4B-it-qat-UD-Q4_K_XL}"
 export CACHE_DIR="${CACHE_DIR:-$HOME/.cache/llama.cpp-launch-scripts/gemma4-e4b-it-ud-q4kxl}"
 export CTX="${CTX:-60000}"
 export BATCH="${BATCH:-4096}"

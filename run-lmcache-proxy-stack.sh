@@ -54,7 +54,12 @@ export CACHE_V="${CACHE_V:-turbo3}"
 export MTP="${MTP:-0}"
 export HOST="$BACKEND_HOST"
 export PORT="$BACKEND_PORT"
-export ALIAS="${ALIAS:-local-model}"
+if [[ -z "${ALIAS:-}" && -n "${MODEL:-}" ]]; then
+  model_alias="$(basename "${MODEL%.gguf}")"
+  export ALIAS="local-model,$model_alias"
+else
+  export ALIAS="${ALIAS:-local-model}"
+fi
 export SLOT_SAVE_PATH="$CACHE_DIR"
 export CACHE_RAM="${CACHE_RAM:-0}"
 export BACKEND_SCRIPT="${BACKEND_SCRIPT:-run-qwen36-reap.sh}"
