@@ -53,6 +53,7 @@ class PrefixCacheTests(unittest.TestCase):
             self.assertEqual(len(configs), 1)
             self.assertEqual(configs[0]["label"], "end-of-system-message")
             self.assertEqual(configs[0]["marker"], "<|im_end|>")
+            self.assertEqual(int(configs[0]["pinned"]), 0)
 
     def test_lookup_returns_longest_matching_prefix(self):
         with tempfile.TemporaryDirectory() as d:
@@ -168,6 +169,34 @@ class PrefixCacheTests(unittest.TestCase):
             self.assertEqual([n["id"] for n in removed], [old_hot["id"]])
             self.assertIsNone(cache.get_node(old_hot["id"]))
             self.assertIsNotNone(cache.get_node(new_cold["id"]))
+
+    def test_prune_global_uses_plain_lru_across_cache_dirs(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = pathlib.Path(d)
+            cache_a = prefix_cache.PrefixCache(root / "cache-a")
+            cache_b = prefix_cache.PrefixCache(root / "cache-b")
+            cache_a.init()
+            cache_b.init()
+
+            old_node = self._node([1], label="old", bin_file="old.bin")
+            old_node["created_at"] = "2026-05-20T00:00:00Z"
+            old_node["last_used"] = "2026-05-20T01:00:00Z"
+            new_node = self._node([2], label="new", bin_file="new.bin")
+            new_node["created_at"] = "2026-05-20T00:00:00Z"
+            new_node["last_used"] = "2026-05-20T02:00:00Z"
+            (cache_a.cache_dir / old_node["bin_file"]).write_bytes(b"a")
+            (cache_b.cache_dir / new_node["bin_file"]).write_bytes(b"b")
+            cache_a.insert_node(old_node)
+            cache_b.insert_node(new_node)
+
+            removed = cache_a.prune_global(max_bytes=None, max_nodes=1, dry_run=False)
+
+            self.assertEqual([n["id"] for n in removed], [old_node["id"]])
+            self.assertEqual(removed[0]["cache_dir"], str(cache_a.cache_dir))
+            self.assertIsNone(cache_a.get_node(old_node["id"]))
+            self.assertIsNotNone(cache_b.get_node(new_node["id"]))
+            self.assertFalse((cache_a.cache_dir / old_node["bin_file"]).exists())
+            self.assertTrue((cache_b.cache_dir / new_node["bin_file"]).exists())
 
 
 if __name__ == "__main__":

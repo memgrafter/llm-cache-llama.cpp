@@ -87,7 +87,7 @@ class AnchorConfig:
     marker: str
     occurrence: int = 1
     side: str = "after"
-    pinned: bool = True
+    pinned: bool = False
 
 
 @dataclass
@@ -574,13 +574,13 @@ class LMCacheHandler(BaseHTTPRequestHandler):
         if cache is None:
             return False
         cache.init()
-        cache.prune(max_bytes=self.max_cache_bytes, max_nodes=None, dry_run=False)
+        cache.prune_global(max_bytes=self.max_cache_bytes, max_nodes=None, dry_run=False)
 
         while True:
             free = shutil.disk_usage(cache.cache_dir).free
             if free >= self.min_free_bytes:
                 return True
-            total = cache.total_bytes()
+            total = cache.total_bytes_global()
             if total <= 0:
                 log.warning(
                     "prefix-cache autosave skipped: free disk %d bytes below minimum %d and no cache is prunable",
@@ -588,7 +588,7 @@ class LMCacheHandler(BaseHTTPRequestHandler):
                     self.min_free_bytes,
                 )
                 return False
-            removed = cache.prune(max_bytes=max(total - 1, 0), max_nodes=None, dry_run=False)
+            removed = cache.prune_global(max_bytes=max(total - 1, 0), max_nodes=None, dry_run=False)
             if not removed:
                 log.warning(
                     "prefix-cache autosave skipped: free disk %d bytes below minimum %d and no leaf cache node is prunable",
@@ -874,7 +874,7 @@ class LMCacheHandler(BaseHTTPRequestHandler):
             cache.insert_node(generated_node)
             inserted_nodes.append(generated_node_id)
 
-        cache.prune(max_bytes=self.max_cache_bytes, max_nodes=None, dry_run=False)
+        cache.prune_global(max_bytes=self.max_cache_bytes, max_nodes=None, dry_run=False)
         log.info(
             "prefix-cache autosaved %d node(s): prompt=%s generated=%s (%d→%d saved tokens, %.1f MiB, anchors=%d)",
             len(inserted_nodes),
@@ -987,7 +987,7 @@ def main():
     parser.add_argument("--top-k", type=int, default=3, help="Legacy cache top-k fallback")
     parser.add_argument("--slot", type=int, default=0, help="llama.cpp slot id to restore/save (default: 0)")
     parser.add_argument("--min-save-tokens", type=int, default=256, help="Minimum tokens before autosaving a prefix node")
-    parser.add_argument("--prefix-cache-max-bytes", type=parse_bytes, default=2 * GIB, help="Max prefix cache bytes before pruning (default: 2GiB)")
+    parser.add_argument("--prefix-cache-max-bytes", type=parse_bytes, default=8 * GIB, help="Max prefix cache bytes before pruning (default: 8GiB)")
     parser.add_argument("--prefix-cache-min-free-bytes", type=parse_bytes, default=512 * MIB, help="Minimum filesystem free bytes before autosave (default: 512MiB)")
     parser.add_argument("--no-prefix-cache", action="store_true", help="Disable trie-backed prefix cache")
     parser.add_argument("--no-auto-save", action="store_true", help="Disable autosaving completed requests into prefix cache")

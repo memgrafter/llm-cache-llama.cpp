@@ -181,6 +181,7 @@ class LlamaClient:
 class PrefixCache:
     def __init__(self, cache_dir: pathlib.Path):
         self.cache_dir = cache_dir.expanduser()
+        self.cache_root = self.cache_dir.parent
         self.trie_dir = self.cache_dir / "trie"
         self.nodes_dir = self.trie_dir / "nodes"
         self.db_path = self.trie_dir / "prefix-cache.sqlite"
@@ -237,7 +238,7 @@ class PrefixCache:
                     marker TEXT NOT NULL,
                     occurrence INTEGER NOT NULL,
                     side TEXT NOT NULL,
-                    pinned INTEGER NOT NULL DEFAULT 1,
+                    pinned INTEGER NOT NULL DEFAULT 0,
                     enabled INTEGER NOT NULL DEFAULT 1,
                     created_at TEXT NOT NULL,
                     meta_json TEXT NOT NULL DEFAULT '{}'
@@ -255,11 +256,23 @@ class PrefixCache:
                     "<|im_end|>",
                     1,
                     "after",
-                    1,
+                    0,
                     1,
                     utc_now(),
                     json.dumps({"description": "prefix through first chat-template end-of-message marker"}, sort_keys=True),
                 ),
+            )
+            db.execute(
+                "UPDATE anchor_configs SET pinned = 0 WHERE label = ?",
+                ("end-of-system-message",),
+            )
+            db.execute(
+                "UPDATE anchors SET pinned = 0 WHERE label = ?",
+                ("end-of-system-message",),
+            )
+            db.execute(
+                "UPDATE nodes SET pinned = 0 WHERE boundary = 'anchor' AND label = ?",
+                ("end-of-system-message",),
             )
             db.commit()
 
@@ -492,6 +505,169 @@ class PrefixCache:
                 """
             ).fetchone()
         return int(row[0])
+
+    @staticmethod
+    def _total_bytes_in_db(db: sqlite3.Connection) -> int:
+        row = db.execute(
+            """
+            SELECT COALESCE(SUM(size_bytes), 0)
+            FROM (SELECT bin_file, MAX(size_bytes) AS size_bytes FROM nodes GROUP BY bin_file)
+            """
+        ).fetchone()
+        return int(row[0])
+
+    @classmethod
+    def discover(cls, cache_root: pathlib.Path) -> list["PrefixCache"]:
+        root = cache_root.expanduser()
+        out: list[PrefixCache] = []
+        for db_path in sorted(root.glob("*/trie/prefix-cache.sqlite")):
+            cache = cls(db_path.parent.parent)
+            cache.init()
+            out.append(cache)
+        return out
+
+    def total_bytes_global(self) -> int:
+        total = 0
+        for cache in self.discover(self.cache_root):
+            if not cache.db_path.exists():
+                continue
+            with contextlib.closing(cache.connect()) as db:
+                total += self._total_bytes_in_db(db)
+        return total
+
+    @staticmethod
+    def _prune_candidates_query() -> str:
+        return """
+            SELECT
+              n.*,
+              (SELECT COUNT(*) FROM nodes r WHERE r.bin_file = n.bin_file) AS bin_refs
+            FROM nodes n
+            LEFT JOIN nodes c ON c.parent_id = n.id
+            WHERE c.id IS NULL AND n.pinned = 0
+            ORDER BY
+              COALESCE(n.last_used, n.created_at) ASC,
+              n.id ASC
+        """
+
+    def prune_global(self, *, max_bytes: int | None, max_nodes: int | None, dry_run: bool) -> list[dict[str, Any]]:
+        removed: list[dict[str, Any]] = []
+        while True:
+            caches = [cache for cache in self.discover(self.cache_root) if cache.db_path.exists()]
+            total_bytes = 0
+            total_nodes = 0
+            per_cache_candidates: list[tuple[tuple[str, str, str], PrefixCache, dict[str, Any]]] = []
+
+            for cache in caches:
+                with contextlib.closing(cache.connect()) as db:
+                    total_bytes += self._total_bytes_in_db(db)
+                    total_nodes += int(db.execute("SELECT COUNT(*) FROM nodes").fetchone()[0])
+                    row = db.execute(self._prune_candidates_query() + " LIMIT 1").fetchone()
+                    if row:
+                        candidate = dict(row)
+                        sort_key = (
+                            str(candidate.get("last_used") or candidate.get("created_at") or ""),
+                            str(candidate.get("id") or ""),
+                            str(cache.cache_dir),
+                        )
+                        per_cache_candidates.append((sort_key, cache, candidate))
+
+            over_bytes = max_bytes is not None and total_bytes > max_bytes
+            over_nodes = max_nodes is not None and total_nodes > max_nodes
+            if not over_bytes and not over_nodes:
+                break
+
+            if not per_cache_candidates:
+                log.warning(
+                    "prefix-cache global prune wanted but found no removable leaf nodes: %s",
+                    json.dumps(
+                        {
+                            "scope": "global",
+                            "cache_root": str(self.cache_root),
+                            "total_bytes": total_bytes,
+                            "total_nodes": total_nodes,
+                            "max_bytes": max_bytes,
+                            "max_nodes": max_nodes,
+                            "over_bytes": over_bytes,
+                            "over_nodes": over_nodes,
+                            "dry_run": dry_run,
+                            "candidates": [],
+                        },
+                        sort_keys=True,
+                    ),
+                )
+                break
+
+            per_cache_candidates.sort(key=lambda item: item[0])
+            _, chosen_cache, chosen = per_cache_candidates[0]
+            decision_data = []
+            for rank, (_, cache, candidate) in enumerate(per_cache_candidates, 1):
+                decision_data.append(
+                    {
+                        "rank": rank,
+                        "selected": rank == 1,
+                        "cache_dir": str(cache.cache_dir),
+                        "id": candidate["id"],
+                        "boundary": candidate.get("boundary"),
+                        "label": candidate.get("label"),
+                        "token_count": candidate.get("token_count"),
+                        "parent_id": candidate.get("parent_id"),
+                        "bin_file": candidate.get("bin_file"),
+                        "bin_refs": candidate.get("bin_refs"),
+                        "would_unlink_bin": int(candidate.get("bin_refs") or 0) <= 1,
+                        "size_bytes": candidate.get("size_bytes"),
+                        "hits": candidate.get("hits"),
+                        "created_at": candidate.get("created_at"),
+                        "last_used": candidate.get("last_used"),
+                        "sort_key": {
+                            "last_used_or_created_at": candidate.get("last_used") or candidate.get("created_at"),
+                            "id": candidate.get("id"),
+                            "cache_dir": str(cache.cache_dir),
+                        },
+                    }
+                )
+
+            node = dict(chosen)
+            node.pop("bin_refs", None)
+            node["cache_dir"] = str(chosen_cache.cache_dir)
+            log.info(
+                "prefix-cache global prune selected %s: %s",
+                node["id"],
+                json.dumps(
+                    {
+                        "scope": "global",
+                        "cache_root": str(self.cache_root),
+                        "selected_id": node["id"],
+                        "selected_cache_dir": str(chosen_cache.cache_dir),
+                        "reason": "least-recently-used unpinned leaf across cache dirs by COALESCE(last_used, created_at)",
+                        "total_bytes": total_bytes,
+                        "total_nodes": total_nodes,
+                        "max_bytes": max_bytes,
+                        "max_nodes": max_nodes,
+                        "over_bytes": over_bytes,
+                        "over_nodes": over_nodes,
+                        "dry_run": dry_run,
+                        "candidates": decision_data,
+                    },
+                    sort_keys=True,
+                ),
+            )
+            removed.append(node)
+            if dry_run:
+                break
+
+            with contextlib.closing(chosen_cache.connect()) as db:
+                db.execute("DELETE FROM nodes WHERE id = ?", (node["id"],))
+                remaining_refs = int(
+                    db.execute("SELECT COUNT(*) FROM nodes WHERE bin_file = ?", (node["bin_file"],)).fetchone()[0]
+                )
+                if remaining_refs == 0:
+                    bin_path = chosen_cache.absolute_bin_path(node["bin_file"])
+                    try:
+                        bin_path.unlink()
+                    except FileNotFoundError:
+                        pass
+                db.commit()
+        return removed
 
     def prune(self, *, max_bytes: int | None, max_nodes: int | None, dry_run: bool) -> list[dict[str, Any]]:
         removed: list[dict[str, Any]] = []

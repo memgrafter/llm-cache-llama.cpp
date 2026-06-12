@@ -13,7 +13,7 @@ python3 lmcache-proxy-on-demand.py \
   --cache-dir ~/.cache/llama.cpp-launch-scripts/slot-kv \
   --top-k 3 \
   --min-save-tokens 256 \
-  --prefix-cache-max-bytes 4GiB \
+  --prefix-cache-max-bytes 8GiB \
   --prefix-cache-min-free-bytes 512MiB
 ```
 
@@ -26,7 +26,7 @@ python3 lmcache-proxy-on-demand.py \
 | `--cache-dir` | Disk KV cache directory. |
 | `--top-k` | Legacy cache fallback candidate count. |
 | `--min-save-tokens` | Minimum rendered-prompt token count before automatic prefix-cache autosave. |
-| `--prefix-cache-max-bytes` | Trie-backed prefix-cache size limit. |
+| `--prefix-cache-max-bytes` | Global trie-backed prefix-cache size limit across cache subdirectories. |
 | `--prefix-cache-min-free-bytes` | Minimum filesystem free space before autosave. |
 | `--no-auto-save` | Restore matching prefixes but do not save completed requests. |
 | `--no-prefix-cache` | Disable trie-backed prefix-cache integration. |
@@ -77,7 +77,7 @@ It is less valuable for tool workflows where most new tokens come from **tool ou
 
 Anchors are shared context prefixes (system prompts, developer prompts, tool schemas, project context) that get materialized once and reused across conversations.
 
-Anchor config creation is automatic during DB init. Anchor KV creation is lazy: the first request whose rendered chat prompt contains a configured anchor will materialize an anchor-only node if no matching node exists yet. Watch for:
+Anchor config creation is automatic during DB init. Anchor KV creation is lazy: the first request whose rendered chat prompt contains a configured anchor will materialize an anchor-only node if no matching node exists yet. Anchor nodes are not pinned by default, so they participate in the global LRU pool like other cache entries. Watch for:
 
 ```text
 prefix-cache materialized anchor node ...
