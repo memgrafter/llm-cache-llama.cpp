@@ -11,3 +11,6 @@ logs/
 slot-kv/
 __pycache__/
 models/
+
+# Local burn-in helper
+run-qwopus27-burnin20-bg.sh
