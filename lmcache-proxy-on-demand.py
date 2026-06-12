@@ -569,37 +569,54 @@ class LMCacheHandler(BaseHTTPRequestHandler):
                     log.info("legacy KV restored before forwarding request")
                     return
 
-    def _ensure_storage_room(self) -> bool:
+    def _ensure_storage_room(self, reserve_bytes: int = 0) -> bool:
         cache = self.prefix_cache_obj
         if cache is None:
             return False
         cache.init()
-        cache.prune_global(max_bytes=self.max_cache_bytes, max_nodes=None, dry_run=False)
+        reserve_bytes = max(0, int(reserve_bytes))
+        target_max_bytes = None if self.max_cache_bytes is None else max(self.max_cache_bytes - reserve_bytes, 0)
+        cache.prune_global(max_bytes=target_max_bytes, max_nodes=None, dry_run=False)
 
+        total = cache.total_bytes_global()
+        if self.max_cache_bytes is not None and total + reserve_bytes > self.max_cache_bytes:
+            log.warning(
+                "prefix-cache autosave skipped: could not reserve %d bytes within max cache budget %d (current=%d)",
+                reserve_bytes,
+                self.max_cache_bytes,
+                total,
+            )
+            return False
+
+        required_free = self.min_free_bytes + reserve_bytes
         while True:
             free = shutil.disk_usage(cache.cache_dir).free
-            if free >= self.min_free_bytes:
+            if free >= required_free:
                 return True
             total = cache.total_bytes_global()
             if total <= 0:
                 log.warning(
-                    "prefix-cache autosave skipped: free disk %d bytes below minimum %d and no cache is prunable",
+                    "prefix-cache autosave skipped: free disk %d bytes below required %d and no cache is prunable",
                     free,
-                    self.min_free_bytes,
+                    required_free,
                 )
                 return False
             removed = cache.prune_global(max_bytes=max(total - 1, 0), max_nodes=None, dry_run=False)
             if not removed:
                 log.warning(
-                    "prefix-cache autosave skipped: free disk %d bytes below minimum %d and no leaf cache node is prunable",
+                    "prefix-cache autosave skipped: free disk %d bytes below required %d and no leaf cache node is prunable",
                     free,
-                    self.min_free_bytes,
+                    required_free,
                 )
                 return False
             log.info("prefix-cache pruned %d node(s) to recover low disk space", len(removed))
 
     def _props(self) -> dict:
-        props = _call_llama("GET", "/props", None, self.llama_server, self.llama_port, timeout=30)
+        try:
+            props = _call_llama("GET", "/props", None, self.llama_server, self.llama_port, timeout=30)
+        except Exception as e:
+            log.debug("/props lookup failed: %s", e)
+            return {}
         return props if isinstance(props, dict) else {}
 
     @staticmethod
@@ -717,7 +734,28 @@ class LMCacheHandler(BaseHTTPRequestHandler):
 
         cache = self.prefix_cache_obj
         cache.init()
-        if not self._ensure_storage_room():
+        props = self._props()
+        settings = props.get("default_generation_settings", {}) if isinstance(props, dict) else {}
+        response_text = self._captured_response_text(result)
+        expected_n_saved = len(tokens)
+        if response_text:
+            optimistic_tokens = self._tokenize(ctx.prompt_text + response_text)
+            if optimistic_tokens and len(optimistic_tokens) > expected_n_saved:
+                expected_n_saved = len(optimistic_tokens)
+        estimated_size = cache.estimate_save_size_bytes(
+            expected_n_saved,
+            model_alias=props.get("model_alias") if isinstance(props, dict) else None,
+            model_path=props.get("model_path") if isinstance(props, dict) else None,
+            ctx_size=settings.get("n_ctx") if isinstance(settings, dict) else None,
+        )
+        reserve_bytes = int(estimated_size * 1.3) if estimated_size is not None else 0
+        if reserve_bytes > 0:
+            log.info(
+                "prefix-cache reserving %.1f MiB before autosave (%d expected saved tokens, 30%% margin)",
+                reserve_bytes / MIB,
+                expected_n_saved,
+            )
+        if not self._ensure_storage_room(reserve_bytes=reserve_bytes):
             return
 
         tmp_file = f"prefix_tmp_{time.time_ns()}.bin"
@@ -788,8 +826,6 @@ class LMCacheHandler(BaseHTTPRequestHandler):
         tmp_path.rename(bin_path)
         size_bytes = bin_path.stat().st_size
 
-        props = self._props()
-        settings = props.get("default_generation_settings", {}) if isinstance(props, dict) else {}
         common_meta = {
             "source": "lmcache-proxy-on-demand",
             "restored_node_id": ctx.restored_node_id,

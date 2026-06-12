@@ -535,6 +535,78 @@ class PrefixCache:
                 total += self._total_bytes_in_db(db)
         return total
 
+    def estimate_save_size_bytes(
+        self,
+        expected_n_saved: int,
+        *,
+        model_alias: str | None = None,
+        model_path: str | None = None,
+        ctx_size: int | None = None,
+    ) -> int | None:
+        if expected_n_saved <= 0:
+            return None
+
+        samples: list[tuple[int, int]] = []
+        for cache in self.discover(self.cache_root):
+            if not cache.db_path.exists():
+                continue
+            with contextlib.closing(cache.connect()) as db:
+                where = ["n_saved > 0", "size_bytes > 0"]
+                params: list[Any] = []
+                if model_path:
+                    where.append("model_path = ?")
+                    params.append(model_path)
+                elif model_alias:
+                    where.append("model_alias = ?")
+                    params.append(model_alias)
+                if ctx_size is not None:
+                    where.append("ctx_size = ?")
+                    params.append(int(ctx_size))
+                rows = db.execute(
+                    f"SELECT MAX(n_saved) AS n_saved, MAX(size_bytes) AS size_bytes FROM nodes WHERE {' AND '.join(where)} GROUP BY bin_file"
+                    ,
+                    params,
+                ).fetchall()
+                for row in rows:
+                    n_saved = int(row[0])
+                    size_bytes = int(row[1])
+                    if n_saved > 0 and size_bytes > 0:
+                        samples.append((n_saved, size_bytes))
+
+        samples = sorted(set(samples))
+        if len(samples) < 2:
+            return None
+
+        xs = [float(x) for x, _ in samples]
+        ys = [float(y) for _, y in samples]
+        x_mean = sum(xs) / len(xs)
+        y_mean = sum(ys) / len(ys)
+        denom = sum((x - x_mean) ** 2 for x in xs)
+        slope = 0.0 if denom <= 0 else sum((x - x_mean) * (y - y_mean) for x, y in zip(xs, ys)) / denom
+        slope = max(0.0, slope)
+        intercept = max(0.0, y_mean - slope * x_mean)
+        regression_estimate = intercept + slope * float(expected_n_saved)
+
+        local_estimate = ys[0]
+        if expected_n_saved <= samples[0][0]:
+            local_estimate = ys[0]
+        elif expected_n_saved >= samples[-1][0]:
+            x1, y1 = samples[-2]
+            x2, y2 = samples[-1]
+            tail_slope = 0.0 if x2 <= x1 else max(0.0, (float(y2) - float(y1)) / float(x2 - x1))
+            local_estimate = float(y2) + tail_slope * float(expected_n_saved - x2)
+        else:
+            for (x1, y1), (x2, y2) in zip(samples, samples[1:]):
+                if x1 <= expected_n_saved <= x2:
+                    if x2 == x1:
+                        local_estimate = float(max(y1, y2))
+                    else:
+                        ratio = float(expected_n_saved - x1) / float(x2 - x1)
+                        local_estimate = float(y1) + ratio * float(y2 - y1)
+                    break
+
+        return max(1, int(max(regression_estimate, local_estimate)))
+
     @staticmethod
     def _prune_candidates_query() -> str:
         return """

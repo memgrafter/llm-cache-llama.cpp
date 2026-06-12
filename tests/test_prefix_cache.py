@@ -198,6 +198,33 @@ class PrefixCacheTests(unittest.TestCase):
             self.assertFalse((cache_a.cache_dir / old_node["bin_file"]).exists())
             self.assertTrue((cache_b.cache_dir / new_node["bin_file"]).exists())
 
+    def test_estimate_save_size_bytes_uses_global_samples(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = pathlib.Path(d)
+            cache_a = prefix_cache.PrefixCache(root / "cache-a")
+            cache_b = prefix_cache.PrefixCache(root / "cache-b")
+            cache_a.init()
+            cache_b.init()
+
+            small = self._node([1] * 100, label="small", bin_file="small.bin")
+            small["size_bytes"] = 1_000
+            small["n_saved"] = 100
+            small["model_path"] = "/tmp/model.gguf"
+            small["ctx_size"] = 4096
+            large = self._node([2] * 200, label="large", bin_file="large.bin")
+            large["size_bytes"] = 2_000
+            large["n_saved"] = 200
+            large["model_path"] = "/tmp/model.gguf"
+            large["ctx_size"] = 4096
+            cache_a.insert_node(small)
+            cache_b.insert_node(large)
+
+            estimate = cache_a.estimate_save_size_bytes(150, model_path="/tmp/model.gguf", ctx_size=4096)
+
+            self.assertIsNotNone(estimate)
+            self.assertGreaterEqual(estimate, 1500)
+            self.assertLessEqual(estimate, 2000)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
