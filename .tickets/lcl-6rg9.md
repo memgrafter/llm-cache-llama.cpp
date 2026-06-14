@@ -1,6 +1,6 @@
 ---
 id: lcl-6rg9
-status: open
+status: in_progress
 deps: []
 links: []
 created: 2026-06-14T07:37:04Z
