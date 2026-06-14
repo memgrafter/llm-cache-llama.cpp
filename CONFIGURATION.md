@@ -35,7 +35,7 @@ python3 lmcache-proxy-on-demand.py \
 
 On each request, the proxy renders/tokenizes the prompt, restores the best strict-prefix trie node into slot 0, forwards the request, streams the response, then saves the slot and records a trie node keyed by the incoming rendered prompt tokens. If an exact cached prefix is found while exact restores are disabled, the proxy may append a newline and restore the exact node as a strict-prefix workaround for the current llama.cpp crash. When the saved slot bin exposes token IDs and the captured stream text verifies against those token IDs, the proxy also records an optimistic generated-response prefix node that points at the same bin. If full-prefix lookup misses, the first request for a configured anchor such as `end-of-system-message` materializes an anchor-only KV node; later requests restore that materialized anchor node.
 
-## run-qwen36-reap.sh — backend only
+## _llama-engine.sh — backend only
 
 Launches llama.cpp directly. In the supervised proxy stack, this is called by `run-lmcache-proxy-stack.sh` with `PORT=8082`.
 

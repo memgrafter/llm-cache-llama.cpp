@@ -62,7 +62,7 @@ else
 fi
 export SLOT_SAVE_PATH="$CACHE_DIR"
 export CACHE_RAM="${CACHE_RAM:-0}"
-export BACKEND_SCRIPT="${BACKEND_SCRIPT:-run-qwen36-reap.sh}"
+export BACKEND_SCRIPT="${BACKEND_SCRIPT:-_llama-engine.sh}"
 
 LOG_DIR="${LOG_DIR:-$SCRIPT_DIR/logs}"
 mkdir -p "$LOG_DIR" "$CACHE_DIR"

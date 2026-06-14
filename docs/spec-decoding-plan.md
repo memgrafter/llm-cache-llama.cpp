@@ -38,7 +38,7 @@ Or through the backend only:
 
 ```bash
 EXTRA_FLAGS="--spec-type ngram-mod --spec-ngram-mod-n-match 24 --spec-ngram-mod-n-min 48 --spec-ngram-mod-n-max 64" \
-./run-qwen36-reap.sh --serve
+./_llama-engine.sh --serve
 ```
 
 This is probably the safest production candidate.
@@ -116,7 +116,7 @@ EXTRA_FLAGS="--spec-type draft-simple --spec-draft-model /path/to/draft.gguf --s
 
 ## Implementation direction later
 
-Add explicit env knobs to `run-qwen36-reap.sh`, probably:
+Add explicit env knobs to `_llama-engine.sh`, probably:
 
 ```bash
 SPEC_TYPE="${SPEC_TYPE:-}"

@@ -68,7 +68,7 @@ cmake .. -DCMAKE_BUILD_TYPE=Release -DLLAMA_METAL=ON
 make -j$(sysctl -n hw.ncpu)
 ```
 
-Update the path alias in `run-qwen36-reap.sh` to point at your build:
+Update the path alias in `_llama-engine.sh` to point at your build:
 
 ```bash
 export LOCAL_TURBO_BUILD="$(pwd)"  # or set it directly in the script
