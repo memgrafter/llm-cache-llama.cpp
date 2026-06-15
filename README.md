@@ -66,7 +66,7 @@ When the supervisor/proxy stops, it also stops the llama.cpp backend.
 | `SPEC_NGRAM_MOD_N_MATCH` | `24` | n-gram lookup length for `ngram-mod`. |
 | `SPEC_NGRAM_MOD_N_MIN` | `48` | Minimum n-gram draft length for `ngram-mod`. |
 | `SPEC_NGRAM_MOD_N_MAX` | `63` | Maximum n-gram draft length for `ngram-mod`; clamped to `BATCH - 1` because llama.cpp verifies one sampled token plus draft tokens in one logical batch. |
-| `TOP_K` | `3` | Legacy KV candidates the proxy may try per prompt. |
+| `LMCACHE_TOP_K` | `3` | Legacy KV candidates the proxy may try per prompt. |
 | `MIN_SAVE_TOKENS` | `256` | Minimum rendered-prompt token count before automatic prefix-cache autosave. |
 | `PREFIX_CACHE_MAX_BYTES` | `8GiB` | Global trie-backed prefix-cache size limit across cache subdirectories; unpinned leaf nodes are pruned by LRU to stay under it. |
 | `PREFIX_CACHE_MIN_FREE_BYTES` | `512MiB` | Minimum filesystem free space required before autosave; the proxy prunes or skips gracefully below it. |

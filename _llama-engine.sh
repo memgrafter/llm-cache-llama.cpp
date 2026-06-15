@@ -1,12 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Qwen3.6-28B-REAP.i1-IQ3_XXS.gguf runner/server for tight-memory Apple Metal use.
-# Override any setting with an env var, for example:
-#   CTX=4096 CACHE_K=q4_0 CACHE_V=q4_0 ./run-qwen36-reap.sh
-#   CTX=8192 BATCH=64 UBATCH=16 ./run-qwen36-reap.sh
-#   ./run-qwen36-reap.sh --serve
-#   TURBOQUANT_FLAGS="--the-real-flag" ./run-qwen36-reap.sh
+# Llama.cpp backend engine for the LMCache proxy stack.
+# All configuration is set by run-lmcache-proxy-stack.sh via env vars.
+# Run directly with: ./_llama-engine.sh [--serve]
 
 SERVE=0
 if [[ "${1:-}" == "--serve" ]]; then
@@ -21,7 +18,7 @@ LOCAL_TURBO_BUILD="${LOCAL_TURBO_BUILD:-$SCRIPT_DIR/builds/llama-cpp-turboquant-
 LOCAL_B9222_BUILD="${LOCAL_B9222_BUILD:-$SCRIPT_DIR/builds/llama-b9222}"
 MODEL="${MODEL:-$MODELS_DIR/Qwen3.6-28B-REAP.i1-IQ3_XXS.gguf}"
 # MODEL="${MODEL:-$MODELS_DIR/Qwen3.6-28B-REAP.i1-IQ3_M.gguf}"
-export GGML_METAL_NO_RESIDENCY="${GGML_METAL_NO_RESIDENCY:-1}"
+# GGML_METAL_NO_RESIDENCY is set by the proxy stack.
 
 # Binary autodetect. Override with BIN=/path/to/llama-cli or SERVER_BIN=/path/to/llama-server if needed.
 if [[ "$SERVE" == "1" ]]; then
@@ -60,32 +57,13 @@ else
   fi
 fi
 
-# Context/memory knobs.
-CTX="${CTX:-60000}"
+# Context/memory knobs. Set by the proxy stack via env vars.
 NPRED="${NPRED:-8192}"
-NGL="${NGL:-999}"
-THREADS="${THREADS:-$(sysctl -n hw.perflevel0.physicalcpu 2>/dev/null || sysctl -n hw.physicalcpu 2>/dev/null || echo 8)}"
-BATCH="${BATCH:-64}"
-UBATCH="${UBATCH:-16}"
-CACHE_K="${CACHE_K:-q8_0}"
-CACHE_V="${CACHE_V:-turbo3}"
 
-# Server knobs.
-HOST="${HOST:-127.0.0.1}"
-PORT="${PORT:-8081}"
-ALIAS="${ALIAS:-local-model}"
-PARALLEL="${PARALLEL:-1}"
-MTP="${MTP:-0}"
-SLOT_SAVE_PATH="${SLOT_SAVE_PATH:-$HOME/.cache/llama.cpp-launch-scripts/slot-kv}"
-CACHE_REUSE="${CACHE_REUSE:-256}"
-CACHE_RAM="${CACHE_RAM:-0}"
+# Server knobs. Set by the proxy stack via env vars.
 
-# Speculative decoding. ngram-mod is draft-model-free and low-memory; the target model
-# still verifies all draft tokens. Set SPEC_TYPE=none to disable.
-SPEC_TYPE="${SPEC_TYPE:-ngram-mod}"
-SPEC_NGRAM_MOD_N_MATCH="${SPEC_NGRAM_MOD_N_MATCH:-24}"
-SPEC_NGRAM_MOD_N_MIN="${SPEC_NGRAM_MOD_N_MIN:-48}"
-SPEC_NGRAM_MOD_N_MAX="${SPEC_NGRAM_MOD_N_MAX:-63}"
+# Speculative decoding. Set by the proxy stack via env vars.
+# SPEC_TYPE, SPEC_NGRAM_MOD_N_MATCH/MIN/MAX are read from env.
 SPEC_NGRAM_MOD_N_MIN_EFFECTIVE="$SPEC_NGRAM_MOD_N_MIN"
 SPEC_NGRAM_MOD_N_MAX_EFFECTIVE="$SPEC_NGRAM_MOD_N_MAX"
 if [[ ",$SPEC_TYPE," == *,ngram-mod,* && "$BATCH" =~ ^[0-9]+$ && "$SPEC_NGRAM_MOD_N_MAX" =~ ^[0-9]+$ ]]; then
@@ -100,9 +78,7 @@ if [[ ",$SPEC_TYPE," == *,ngram-mod,* && "$BATCH" =~ ^[0-9]+$ && "$SPEC_NGRAM_MO
   fi
 fi
 
-# Runtime behavior.
-FLASH_ATTN="${FLASH_ATTN:-auto}"
-KV_OFFLOAD="${KV_OFFLOAD:-1}"
+# Runtime behavior. FLASH_ATTN, KV_OFFLOAD, MLOCK set by the proxy stack via env vars.
 MLock="${MLOCK:-0}"
 TEMP="${TEMP:-0.6}"
 TOP_P="${TOP_P:-0.95}"
@@ -117,12 +93,7 @@ SIMPLE_IO="${SIMPLE_IO:-1}"
 DISPLAY_PROMPT="${DISPLAY_PROMPT:-0}"
 CONVERSATION="${CONVERSATION:-auto}"
 
-# TurboQuant:
-# Some llama.cpp builds/models use TurboQuant kernels implicitly for TQ/IQ GGUF tensor types;
-# if your build exposes an explicit flag, put it in TURBOQUANT_FLAGS.
-# This script also opportunistically enables a literal --turboquant flag if the binary advertises it.
-TURBOQUANT="${TURBOQUANT:-1}"
-TURBOQUANT_FLAGS="${TURBOQUANT_FLAGS:-}"
+# TurboQuant. Set by the proxy stack via env vars.
 
 if [[ ! -x "$BIN" ]]; then
   echo "llama binary is not executable or not found: $BIN" >&2
