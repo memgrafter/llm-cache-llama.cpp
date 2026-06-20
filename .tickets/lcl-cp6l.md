@@ -1,6 +1,6 @@
 ---
 id: lcl-cp6l
-status: in_progress
+status: closed
 deps: []
 links: []
 created: 2026-06-14T07:57:25Z
