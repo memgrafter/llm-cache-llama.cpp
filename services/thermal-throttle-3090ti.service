@@ -1,0 +1,15 @@
+[Unit]
+Description=Set RTX 3090 Ti conservative power limit
+Documentation=man:nvidia-smi(1)
+After=nvidia-persistenced.service
+Wants=nvidia-persistenced.service
+ConditionPathExists=/usr/bin/nvidia-smi
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/nvidia-smi -pm 1
+ExecStart=/usr/bin/nvidia-smi -pl 385
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
