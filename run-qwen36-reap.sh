@@ -225,7 +225,8 @@ fi
 
 if [[ "$MTP" != "0" ]]; then
   args+=(--spec-type draft-mtp --spec-draft-n-max "$MTP" --spec-draft-n-min "$MTP")
-elif [[ -n "$SPEC_TYPE" && "$SPEC_TYPE" != "none" ]]; then
+fi
+if [[ -n "$SPEC_TYPE" && "$SPEC_TYPE" != "none" ]]; then
   args+=(--spec-type "$SPEC_TYPE")
   if [[ ",$SPEC_TYPE," == *,ngram-mod,* ]]; then
     args+=(

@@ -18,9 +18,10 @@ else
   export CACHE_K="${CACHE_K:-turbo3}"
   export CACHE_V="${CACHE_V:-turbo3}"
 fi
-export SPEC_TYPE="${SPEC_TYPE:-none}"
+export SPEC_TYPE="${SPEC_TYPE:-ngram-mod}"
 export MTP="${MTP:-3}"
 export REASONING="${REASONING:-off}"
+export PREFIX_CACHE_MAX_BYTES="${PREFIX_CACHE_MAX_BYTES:-20GiB}"
 export EXTRA_FLAGS="${EXTRA_FLAGS:---no-mmproj}"
 
 exec "$SCRIPT_DIR/run-lmcache-proxy-stack.sh" "$@"
