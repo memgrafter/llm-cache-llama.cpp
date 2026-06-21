@@ -24,6 +24,10 @@ MODEL="${MODEL:-$MODELS_DIR/Qwen3.6-28B-REAP.i1-IQ3_XXS.gguf}"
 if [[ "$SERVE" == "1" ]]; then
   if [[ -n "${SERVER_BIN:-}" ]]; then
     BIN="$SERVER_BIN"
+  elif command -v llama-server >/dev/null 2>&1; then
+    BIN="$(command -v llama-server)"
+  elif [[ -x "llama-server" ]]; then
+    BIN="llama-server"
   elif [[ -x "$LOCAL_TURBO_BUILD/bin/llama-server" ]]; then
     BIN="$LOCAL_TURBO_BUILD/bin/llama-server"
   elif [[ -x "$LOCAL_B9222_BUILD/llama-server" ]]; then
@@ -32,8 +36,6 @@ if [[ "$SERVE" == "1" ]]; then
     BIN="$HOME/clones/llama-cpp-turboquant/build-metal/bin/llama-server"
   elif [[ -x "$LLAMA_DIR/build/bin/llama-server" ]]; then
     BIN="$LLAMA_DIR/build/bin/llama-server"
-  elif command -v llama-server >/dev/null 2>&1; then
-    BIN="$(command -v llama-server)"
   else
     BIN="./llama-server"
   fi
