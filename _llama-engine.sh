@@ -126,6 +126,10 @@ args=(
   --seed "$SEED"
 )
 
+  if [[ -n "${DEVICE:-}" ]]; then
+    args+=(--device "$DEVICE")
+  fi
+
 if [[ "$SERVE" == "1" ]]; then
   [[ -n "$SLOT_SAVE_PATH" ]] && mkdir -p "$SLOT_SAVE_PATH"
 
