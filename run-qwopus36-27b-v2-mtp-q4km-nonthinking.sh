@@ -7,7 +7,7 @@ export MODELS_DIR="${MODELS_DIR:-$SCRIPT_DIR/models}"
 export MODEL="${MODEL:-$MODELS_DIR/Qwopus3.6-27B-v2-MTP-Q4_K_M.gguf}"
 export ALIAS="${ALIAS:-local-model,Qwopus3.6-27B-v2-MTP-Q4_K_M}"
 export CACHE_DIR="${CACHE_DIR:-$HOME/.cache/llama.cpp-launch-scripts/qwopus36-27b-v2-mtp-q4km-nonthinking}"
-export CTX="${CTX:-128000}"
+export CTX="${CTX:-160000}"
 export BATCH="${BATCH:-4096}"
 export UBATCH="${UBATCH:-1024}"
 if [[ "$(uname -s)" == "Linux" ]]; then
@@ -21,7 +21,7 @@ fi
 export SPEC_TYPE="${SPEC_TYPE:-ngram-mod}"
 export MTP="${MTP:-3}"
 export REASONING="${REASONING:-off}"
-export PREFIX_CACHE_MAX_BYTES="${PREFIX_CACHE_MAX_BYTES:-20GiB}"
+export PREFIX_CACHE_MAX_BYTES="${PREFIX_CACHE_MAX_BYTES:-100GiB}"
 export EXTRA_FLAGS="${EXTRA_FLAGS:---no-mmproj}"
 
 exec "$SCRIPT_DIR/run-lmcache-proxy-stack.sh" "$@"
