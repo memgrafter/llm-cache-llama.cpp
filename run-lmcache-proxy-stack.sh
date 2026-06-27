@@ -83,8 +83,8 @@ BACKEND_LOG="${BACKEND_LOG:-$LOG_DIR/qwen36-backend-${STAMP}.log}"
 PROXY_LOG="${PROXY_LOG:-$LOG_DIR/lmcache-proxy-${STAMP}.log}"
 STACK_PID_FILE="${STACK_PID_FILE:-/tmp/lmcache-proxy-stack.pid}"
 STACK_LOG="${STACK_LOG:-$LOG_DIR/stack-${STAMP}.log}"
-PROXY_PID_FILE="${PROXY_PID_FILE:-/tmp/lmcache-proxy.pid}"
-BACKEND_PID_FILE="${BACKEND_PID_FILE:-/tmp/qwen36-llamacpp-backend.pid}"
+PROXY_PID_FILE="${PROXY_PID_FILE:-/tmp/lmcache-proxy-${PUBLIC_PORT}.pid}"
+BACKEND_PID_FILE="${BACKEND_PID_FILE:-/tmp/qwen36-llamacpp-backend-${BACKEND_PORT}.pid}"
 
 if [[ "$BACKGROUND" == "1" ]]; then
   echo "Starting supervised stack in background"

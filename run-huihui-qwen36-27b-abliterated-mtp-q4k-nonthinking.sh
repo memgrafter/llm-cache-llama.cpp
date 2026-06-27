@@ -4,6 +4,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 export MODELS_DIR="${MODELS_DIR:-$SCRIPT_DIR/models}"
 
+export PUBLIC_HOST="0.0.0.0"
 export DEVICE="${DEVICE:-CUDA1}"
 export MODEL="${MODEL:-$MODELS_DIR/Huihui-Qwen3.6-27B-abliterated-MTP-Q4_K.gguf}"
 export ALIAS="${ALIAS:-local-model,Huihui-Qwen3.6-27B-abliterated-MTP-Q4_K}"
