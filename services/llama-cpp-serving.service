@@ -13,7 +13,10 @@ Environment=HOME=__HOME__
 Environment=TERM=xterm-256color
 Environment=PUBLIC_HOST=0.0.0.0
 ExecStartPre=-/usr/bin/tmux kill-session -t llama_cpp-serving
-ExecStart=/usr/bin/tmux new-session -d -s llama_cpp-serving -c __WORKDIR__ '/usr/bin/bash -lc "./run-qwopus36-27b-v2-mtp-q4km-nonthinking.sh"'
+ExecStart=/bin/bash -c 'tmux new-session -d -s llama_cpp-serving -c __WORKDIR__ -n qwopus \
+    /usr/bin/bash -lc ./run-qwopus36-27b-v2-mtp-q4km-nonthinking.sh && \
+    tmux new-window -t llama_cpp-serving -n huihui -c __WORKDIR__ \
+    /usr/bin/bash -lc ./run-huihui-qwen36-27b-abliterated-mtp-q4k-nonthinking.sh'
 ExecStop=-/usr/bin/tmux kill-session -t llama_cpp-serving
 RemainAfterExit=yes
 

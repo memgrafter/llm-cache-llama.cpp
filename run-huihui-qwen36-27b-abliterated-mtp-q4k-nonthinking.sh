@@ -22,7 +22,8 @@ else
 fi
 export SPEC_TYPE="${SPEC_TYPE:-ngram-mod}"
 export MTP="${MTP:-3}"
-export REASONING="${REASONING:-off}"
+export REASONING="on"
+# export REASONING_MAX_TOKENS="120"  # controlled per-request by pi
 export PREFIX_CACHE_MAX_BYTES="${PREFIX_CACHE_MAX_BYTES:-100GiB}"
 export PUBLIC_PORT="${PUBLIC_PORT:-8091}"
 export BACKEND_PORT="${BACKEND_PORT:-8092}"

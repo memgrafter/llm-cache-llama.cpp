@@ -139,9 +139,13 @@ if [[ "$SERVE" == "1" ]]; then
     --alias "$ALIAS"
     --parallel "$PARALLEL"
     --no-warmup
-    --reasoning on
+    --reasoning "${REASONING:-on}"
     --metrics
   )
+
+  if [[ -n "${REASONING_MAX_TOKENS:-}" ]]; then
+    args+=(--reasoning-budget "$REASONING_MAX_TOKENS")
+  fi
 
   if [[ -n "$SLOT_SAVE_PATH" ]]; then
     args+=(--slot-save-path "$SLOT_SAVE_PATH")
