@@ -1,0 +1,24 @@
+[Unit]
+Description=Start llama.cpp serving stack in tmux
+Documentation=man:tmux(1)
+After=network-online.target nvidia-persistenced.service thermal-throttle-3090ti.service
+Wants=network-online.target nvidia-persistenced.service thermal-throttle-3090ti.service
+
+[Service]
+Type=oneshot
+User=robbintt
+Group=robbintt
+WorkingDirectory=/home/robbintt/code/llm-cache-llama.cpp
+Environment=HOME=/home/robbintt
+Environment=TERM=xterm-256color
+Environment=PUBLIC_HOST=0.0.0.0
+ExecStartPre=-/usr/bin/tmux kill-session -t llama_cpp-serving
+ExecStart=/bin/bash -c 'tmux new-session -d -s llama_cpp-serving -c /home/robbintt/code/llm-cache-llama.cpp -n qwopus \
+    /usr/bin/bash -lc ./run-qwopus36-27b-v2-mtp-q4km-nonthinking.sh && \
+    tmux new-window -t llama_cpp-serving -n huihui -c /home/robbintt/code/llm-cache-llama.cpp \
+    /usr/bin/bash -lc ./run-huihui-qwen36-27b-abliterated-mtp-q4k-nonthinking.sh'
+ExecStop=-/usr/bin/tmux kill-session -t llama_cpp-serving
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
