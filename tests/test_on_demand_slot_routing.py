@@ -66,9 +66,9 @@ class TestPickSlotForRestore(unittest.TestCase):
         h = make_handler(state=state, discover_slots=[{"id": 0, "is_busy": False}], nodes=nodes)
         node = {"id": "node-A", "parent_id": None, "token_count": 6000}
 
-        # Request (6000) covers slot's prefix (4000) → reuse
+        # Request (6000) covers slot's prefix (4000) → reuse, ancestor match → no restore needed
         result = h._pick_slot_for_restore(node, 6000)
-        self.assertEqual(result, 0)
+        self.assertEqual(result, (0, False))
 
     def test_slot_not_exhausted_falls_through_to_eviction(self):
         """Slot with node >= 5000 tok but request doesn't exhaust slot prefix → not reused,
@@ -83,7 +83,7 @@ class TestPickSlotForRestore(unittest.TestCase):
 
         # Request (4000) doesn't cover slot prefix (6000) → not reused, falls to eviction
         result = h._pick_slot_for_restore(node, 4000)
-        self.assertEqual(result, 0)  # eviction returns slot 0
+        self.assertEqual(result, (0, True))  # eviction returns slot 0, needs restore
         h._evict_slot.assert_called_with(0)
 
     def test_reuses_small_node_when_request_covers_slot(self):
@@ -96,8 +96,8 @@ class TestPickSlotForRestore(unittest.TestCase):
         h = make_handler(state=state, discover_slots=[{"id": 0, "is_busy": False}], nodes=nodes)
         node = {"id": "node-B", "parent_id": None, "token_count": 3000}
 
-        result = h._pick_slot_for_restore(node, 3500)  # >= slot tokens
-        self.assertEqual(result, 0)
+        result = h._pick_slot_for_restore(node, 3500)  # >= slot tokens, ancestor match → no restore
+        self.assertEqual(result, (0, False))
 
     def test_request_shorter_than_slot_falls_through_to_eviction(self):
         """When request is shorter than slot's loaded prefix, slot not reused,
@@ -110,8 +110,8 @@ class TestPickSlotForRestore(unittest.TestCase):
         h = make_handler(state=state, discover_slots=[{"id": 0, "is_busy": True}], mock_evict=True, nodes=nodes)
         node = {"id": "node-B", "parent_id": None, "token_count": 3000}
 
-        result = h._pick_slot_for_restore(node, 2000)  # < slot tokens
-        self.assertEqual(result, 0)  # eviction returns slot 0
+        result = h._pick_slot_for_restore(node, 2000)  # < slot tokens, falls to eviction
+        self.assertEqual(result, (0, True))  # eviction returns slot 0, needs restore
         h._evict_slot.assert_called_with(0)
 
     def test_evicts_small_node_first(self):
@@ -128,7 +128,7 @@ class TestPickSlotForRestore(unittest.TestCase):
 
         node = {"id": "node-new", "token_count": 1000}
         result = h._pick_slot_for_restore(node, 500)
-        self.assertEqual(result, 1)  # evict the small one
+        self.assertEqual(result, (1, True))  # evict the small one, needs restore
         h._evict_slot.assert_called_with(1)
 
     def test_evicts_lru_when_no_small_node(self):
@@ -147,7 +147,7 @@ class TestPickSlotForRestore(unittest.TestCase):
 
         node = {"id": "node-new", "token_count": 1000}
         result = h._pick_slot_for_restore(node, 500)
-        self.assertEqual(result, 0)  # slot 0 is LRU
+        self.assertEqual(result, (0, True))  # slot 0 is LRU, needs restore
         h._evict_slot.assert_called_with(0)
 
     def test_single_slot_mode_returns_hardcoded_slot(self):
@@ -155,6 +155,7 @@ class TestPickSlotForRestore(unittest.TestCase):
         h = make_handler(state=None)
         node = {"id": "node-A", "token_count": 6000}
         result = h._pick_slot_for_restore(node, 4000)
+        # single-slot mode returns just slot_id (int), not tuple
         self.assertEqual(result, 0)
 
     def test_no_node_no_idle_returns_none(self):
@@ -177,9 +178,43 @@ class TestPickSlotForRestore(unittest.TestCase):
         h = make_handler(state=state, discover_slots=[{"id": 0, "is_busy": False}], nodes=nodes)
         node = {"id": "node-B", "parent_id": "node-A", "token_count": 99747}
 
-        # node-B is descendant of node-A → slot 0 holds ancestor → reuse
+        # node-B is descendant of node-A → slot 0 holds ancestor → reuse, no restore needed
         result = h._pick_slot_for_restore(node, 100000)
-        self.assertEqual(result, 0)
+        self.assertEqual(result, (0, False))
+
+    def test_ancestor_match_returns_needs_restore_false(self):
+        """Ancestor match returns needs_restore=False; sibling/eviction returns True."""
+        # Ancestor match → (slot, False)
+        state = SlotState()
+        state.record(0, "node-A", 5000)
+        nodes = {
+            "node-A": {"id": "node-A", "parent_id": None, "token_count": 5000},
+            "node-B": {"id": "node-B", "parent_id": "node-A", "token_count": 8000},
+        }
+        h = make_handler(state=state, discover_slots=[{"id": 0, "is_busy": False}], nodes=nodes)
+        result = h._pick_slot_for_restore(
+            {"id": "node-B", "parent_id": "node-A", "token_count": 8000}, 9000)
+        self.assertEqual(result, (0, False))  # ancestor match, no restore
+
+        # Eviction → (slot, True)
+        state2 = SlotState()
+        state2.record(0, "node-A", 50000)
+        h2 = make_handler(state=state2, discover_slots=[{"id": 0, "is_busy": True}],
+                          mock_evict=True, nodes={})
+        result2 = h2._pick_slot_for_restore(
+            {"id": "node-new", "token_count": 1000}, 500)
+        self.assertEqual(result2, (0, True))  # eviction, needs restore
+
+        # Idle slot → (slot, True)
+        state3 = SlotState()
+        state3.record(0, "node-A", 50000)
+        h3 = make_handler(state=state3, discover_slots=[
+            {"id": 0, "is_busy": True},
+            {"id": 1, "is_busy": False},
+        ], nodes={})
+        result3 = h3._pick_slot_for_restore(
+            {"id": "node-new", "token_count": 1000}, 500)
+        self.assertEqual(result3, (1, True))  # idle slot, needs restore
 
     def test_shallow_ancestor_not_reused(self):
         """When slot holds only a shallow ancestor (< 5000 tok), 80% ratio applies.
@@ -193,10 +228,9 @@ class TestPickSlotForRestore(unittest.TestCase):
         h = make_handler(state=state, discover_slots=[{"id": 0, "is_busy": True}], mock_evict=True, nodes=nodes)
         node = {"id": "node-A", "parent_id": "node-root", "token_count": 5000}
 
-        # shared prefix is 100 tok (< 5000) → 80% ratio: req >= 80
-        # request (3000) >= 80 → true, so slot IS reused
+        # shared prefix is 100 tok — ancestor match → reuse, no restore needed
         result = h._pick_slot_for_restore(node, 3000)
-        self.assertEqual(result, 0)
+        self.assertEqual(result, (0, False))
 
     def test_shallow_ancestor_request_shorter_than_slot(self):
         """When request is shorter than slot's loaded prefix, don't reuse."""
@@ -211,7 +245,7 @@ class TestPickSlotForRestore(unittest.TestCase):
 
         # shared prefix is 100 tok, request (50) < 100 → don't reuse, falls to eviction
         result = h._pick_slot_for_restore(node, 50)
-        self.assertEqual(result, 0)  # eviction returns slot 0
+        self.assertEqual(result, (0, True))  # eviction returns slot 0, needs restore
         h._evict_slot.assert_called_with(0)
 
     def test_idle_slot_used_before_eviction(self):
@@ -225,7 +259,7 @@ class TestPickSlotForRestore(unittest.TestCase):
         node = {"id": "node-new", "token_count": 1000}
 
         result = h._pick_slot_for_restore(node, 500)
-        self.assertEqual(result, 1)  # use idle slot, not evict
+        self.assertEqual(result, (1, True))  # use idle slot, needs restore, not evict
 
 
 class TestThreadingLock(unittest.TestCase):

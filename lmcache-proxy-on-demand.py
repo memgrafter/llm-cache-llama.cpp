@@ -677,14 +677,20 @@ class LMCacheHandler(BaseHTTPRequestHandler):
                  slot_id, node_id, len(slot_tokens), size_bytes / MIB)
         return True
 
-    def _pick_slot_for_restore(self, node: dict | None, req_tokens: int) -> int | None:
-        """Pick the best slot to restore a node into.
+    def _pick_slot_for_restore(self, node: dict | None, req_tokens: int) -> tuple[int, bool] | None:
+        """Pick the best slot and whether a restore is needed.
 
-        In single-slot mode, returns the hardcoded slot_id.
-        In multi-slot mode, prefers a slot that already has this node loaded,
-        then any idle slot. If no idle slots exist and the match is too short
-        to justify overwriting a loaded slot, returns None (caller should skip
-        restore and let llama.cpp handle fresh).
+        Returns (slot_id, needs_restore) or None.
+
+        In single-slot mode, returns (slot_id, True) — always restore since
+        we don't track what's loaded.
+
+        In multi-slot mode:
+        - Ancestor match (slot already has a prefix of the matched node):
+          returns (slot_id, False) — llama.cpp can compute the delta from
+          its existing prefix; no restore needed.
+        - Empty or evicted slot: returns (slot_id, True) — must restore.
+        - No suitable slot: returns None — caller should skip restore.
         """
         if self.slot_state is None:
             return self.slot_id
@@ -727,7 +733,9 @@ class LMCacheHandler(BaseHTTPRequestHandler):
                 slot_tok = self.slot_state.tokens_for(best_slot)
                 if slot_tok is not None and req_tokens >= slot_tok:
                     self.slot_state.touch(best_slot)
-                    return best_slot
+                    # Ancestor match: slot already has a prefix of the matched node.
+                    # llama.cpp can compute the delta from its existing prefix — no restore needed.
+                    return (best_slot, False)
 
             # No ancestor match — check for sibling nodes (same parent, close token count).
             # This happens when autosave creates a node whose parent_for couldn't find
@@ -772,12 +780,14 @@ class LMCacheHandler(BaseHTTPRequestHandler):
                 slot_tok = self.slot_state.tokens_for(best_slot)
                 if slot_tok is not None and req_tokens >= slot_tok:
                     self.slot_state.touch(best_slot)
-                    return best_slot
+                    # Sibling match: same conversation but different node (autosave gap).
+                    # Must restore to get the correct prefix loaded.
+                    return (best_slot, True)
 
         # Otherwise find an empty slot (no loaded KV, safe to restore into)
         empty = self._empty_slots()
         if empty is not None and empty:
-            return empty[0]
+            return (empty[0], True)
 
         # No idle slots — evict to make room.
         # Prefer evicting a slot with a small loaded node (< 10000 tok),
@@ -794,7 +804,7 @@ class LMCacheHandler(BaseHTTPRequestHandler):
             if target is not None:
                 self._evict_slot(target)
                 self.slot_state.forget(target)
-                return target
+                return (target, True)
 
         return None
 
@@ -817,86 +827,118 @@ class LMCacheHandler(BaseHTTPRequestHandler):
         if node and node.get("boundary") == "anchor":
             via = "materialized-anchor"
         if node:
-            slot = self._pick_slot_for_restore(node, req_tokens)
-            if slot is None:
+            slot_result = self._pick_slot_for_restore(node, req_tokens)
+            if slot_result is None:
                 log.debug("prefix-cache match too short to overwrite loaded slot (%d < threshold)",
                           int(node.get("token_count", 0)))
                 return None
-            result = _restore_slot(slot, node["bin_file"], self.llama_server, self.llama_port)
-            if result:
+            # Unpack (slot_id, needs_restore) tuple; single-slot mode returns just slot_id
+            if isinstance(slot_result, tuple):
+                slot, needs_restore = slot_result
+            else:
+                slot, needs_restore = slot_result, True
+
+            if needs_restore:
+                result = _restore_slot(slot, node["bin_file"], self.llama_server, self.llama_port)
+                if result:
+                    ctx.restored_node_id = node["id"]
+                    ctx.restored_via = via
+                    if self.slot_state is not None:
+                        self.slot_state.record(slot, node["id"], int(node.get("token_count", 0)))
+                    log.info("prefix-cache restored node %s (%s tokens) via %s into slot %d",
+                             node["id"], node["token_count"], via, slot)
+                    return slot if self.slot_state is not None else None
+                # Restore failed (e.g. KV cache full — not enough cells for this slot).
+                # Try to make room by erasing a different loaded slot, then retry.
+                if self.slot_state is not None:
+                    other = self._try_make_room_for(slot, node)
+                    if other is not None:
+                        result = _restore_slot(slot, node["bin_file"], self.llama_server, self.llama_port)
+                        if result:
+                            ctx.restored_node_id = node["id"]
+                            ctx.restored_via = via
+                            self.slot_state.record(slot, node["id"], int(node.get("token_count", 0)))
+                            log.info("prefix-cache restored node %s (%s tokens) via %s into slot %d (after evicting slot %d)",
+                                     node["id"], node["token_count"], via, slot, other)
+                            return slot
+                log.warning("prefix-cache restore failed for slot %d — forwarding without cache", slot)
+                return None
+            else:
+                # Ancestor match: slot already has a prefix of the matched node.
+                # llama.cpp will compute the delta from its existing prefix.
                 ctx.restored_node_id = node["id"]
                 ctx.restored_via = via
-                if self.slot_state is not None:
-                    self.slot_state.record(slot, node["id"], int(node.get("token_count", 0)))
-                log.info("prefix-cache restored node %s (%s tokens) via %s into slot %d",
-                         node["id"], node["token_count"], via, slot)
+                log.info("prefix-cache routing to slot %d (no restore needed, ancestor match for node %s)",
+                         slot, node["id"])
                 return slot if self.slot_state is not None else None
-            # Restore failed (e.g. KV cache full — not enough cells for this slot).
-            # Try to make room by erasing a different loaded slot, then retry.
-            if self.slot_state is not None:
-                other = self._try_make_room_for(slot, node)
-                if other is not None:
-                    result = _restore_slot(slot, node["bin_file"], self.llama_server, self.llama_port)
-                    if result:
-                        ctx.restored_node_id = node["id"]
-                        ctx.restored_via = via
-                        self.slot_state.record(slot, node["id"], int(node.get("token_count", 0)))
-                        log.info("prefix-cache restored node %s (%s tokens) via %s into slot %d (after evicting slot %d)",
-                                 node["id"], node["token_count"], via, slot, other)
-                        return slot
-            log.warning("prefix-cache restore failed for slot %d — forwarding without cache", slot)
-            return None
 
         for anchor in sorted(ctx.anchors, key=lambda a: len(a.tokens), reverse=True):
             anchor_node = cache.lookup_materialized_anchor(label=anchor.config.label,
                                                            tokens=anchor.tokens, touch=True)
             if anchor_node:
-                slot = self._pick_slot_for_restore(anchor_node, req_tokens)
-                if slot is None:
+                slot_result = self._pick_slot_for_restore(anchor_node, req_tokens)
+                if slot_result is None:
                     log.debug("prefix-cache anchor match too short to overwrite loaded slot")
                     continue
-                result = _restore_slot(slot, anchor_node["bin_file"],
-                                       self.llama_server, self.llama_port)
-                if result:
-                    ctx.restored_node_id = anchor_node["id"]
-                    ctx.restored_via = f"anchor:{anchor.config.label}"
-                    if self.slot_state is not None:
-                        self.slot_state.record(slot, anchor_node["id"],
-                                               int(anchor_node.get("token_count", 0)))
-                    log.info("prefix-cache restored node %s (%s tokens) via %s into slot %d",
-                             anchor_node["id"], anchor_node["token_count"],
-                             ctx.restored_via, slot)
-                    return slot
-                # Restore failed — try to make room
-                if self.slot_state is not None:
-                    other = self._try_make_room_for(slot, anchor_node)
-                    if other is not None:
-                        result = _restore_slot(slot, anchor_node["bin_file"],
-                                               self.llama_server, self.llama_port)
-                        if result:
-                            ctx.restored_node_id = anchor_node["id"]
-                            ctx.restored_via = f"anchor:{anchor.config.label}"
+                if isinstance(slot_result, tuple):
+                    slot, needs_restore = slot_result
+                else:
+                    slot, needs_restore = slot_result, True
+
+                if needs_restore:
+                    result = _restore_slot(slot, anchor_node["bin_file"],
+                                           self.llama_server, self.llama_port)
+                    if result:
+                        ctx.restored_node_id = anchor_node["id"]
+                        ctx.restored_via = f"anchor:{anchor.config.label}"
+                        if self.slot_state is not None:
                             self.slot_state.record(slot, anchor_node["id"],
                                                    int(anchor_node.get("token_count", 0)))
-                            log.info("prefix-cache restored node %s (%s tokens) via %s into slot %d (after evicting slot %d)",
-                                     anchor_node["id"], anchor_node["token_count"],
-                                     ctx.restored_via, slot, other)
-                            return slot
-                log.warning("prefix-cache anchor restore failed for slot %d", slot)
-                continue
+                        log.info("prefix-cache restored node %s (%s tokens) via %s into slot %d",
+                                 anchor_node["id"], anchor_node["token_count"],
+                                 ctx.restored_via, slot)
+                        return slot
+                    # Restore failed — try to make room
+                    if self.slot_state is not None:
+                        other = self._try_make_room_for(slot, anchor_node)
+                        if other is not None:
+                            result = _restore_slot(slot, anchor_node["bin_file"],
+                                                   self.llama_server, self.llama_port)
+                            if result:
+                                ctx.restored_node_id = anchor_node["id"]
+                                ctx.restored_via = f"anchor:{anchor.config.label}"
+                                self.slot_state.record(slot, anchor_node["id"],
+                                                       int(anchor_node.get("token_count", 0)))
+                                log.info("prefix-cache restored node %s (%s tokens) via %s into slot %d (after evicting slot %d)",
+                                         anchor_node["id"], anchor_node["token_count"],
+                                         ctx.restored_via, slot, other)
+                                return slot
+                    log.warning("prefix-cache anchor restore failed for slot %d", slot)
+                    continue
+                else:
+                    # Ancestor match: slot already has a prefix of the anchor node.
+                    ctx.restored_node_id = anchor_node["id"]
+                    ctx.restored_via = f"anchor:{anchor.config.label}"
+                    log.info("prefix-cache routing to slot %d (no restore needed, ancestor match for anchor node %s)",
+                             slot, anchor_node["id"])
+                    return slot
 
             node = self._materialize_anchor_once(anchor)
             if node:
-                slot = self._pick_slot_for_restore(node, req_tokens)
-                if slot is None:
+                slot_result = self._pick_slot_for_restore(node, req_tokens)
+                if slot_result is None:
                     log.debug("prefix-cache materialized anchor too short to overwrite loaded slot")
                     continue
+                if isinstance(slot_result, tuple):
+                    slot, needs_restore = slot_result
+                else:
+                    slot, needs_restore = slot_result, True
                 ctx.restored_node_id = node["id"]
                 ctx.restored_via = f"anchor-materialized:{anchor.config.label}"
                 if self.slot_state is not None:
                     self.slot_state.record(slot, node["id"], int(node.get("token_count", 0)))
-                log.info("prefix-cache using newly materialized anchor node %s (%s tokens) into slot %d",
-                         node["id"], node["token_count"], slot)
+                log.info("prefix-cache using newly materialized anchor node %s (%s tokens) into slot %d (needs_restore=%s)",
+                         node["id"], node["token_count"], slot, needs_restore)
                 return slot if self.slot_state is not None else None
 
         # No match found — in multi-slot mode, try to find an idle slot anyway
