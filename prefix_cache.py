@@ -774,11 +774,14 @@ class PrefixCache:
                 break
 
             with contextlib.closing(chosen_cache.connect()) as db:
-                # Cascade: delete the leaf, then walk up deleting parents that
-                # become leaves too. Stop at a branching ancestor and redirect
-                # it to a surviving child's file so all old files can unlink.
+                # Cascade: delete the leaf, then walk up to root. Delete parents
+                # that become leaves. At the first branching ancestor (still has
+                # children), record its surviving child's file as redirect target
+                # and update it. Continue to root — any further branching ancestors
+                # also get redirected to the same target.
                 cur_id = node["id"]
                 bins_to_check = []  # (bin_file, absolute_path) pairs
+                redirect_target = None  # set at first branching ancestor
                 while True:
                     cur = db.execute(
                         "SELECT * FROM nodes WHERE id = ?", (cur_id,)
@@ -787,7 +790,6 @@ class PrefixCache:
                         break
                     bins_to_check.append((cur["bin_file"], chosen_cache.absolute_bin_path(cur["bin_file"])))
                     db.execute("DELETE FROM nodes WHERE id = ?", (cur_id,))
-                    # Check if parent is now a leaf
                     parent_id = cur["parent_id"]
                     if parent_id is None:
                         break
@@ -796,26 +798,36 @@ class PrefixCache:
                         (parent_id,),
                     ).fetchone()[0])
                     if child_count > 0:
-                        # Parent still has children — redirect it to a surviving
-                        # child's file, then stop
-                        child_row = db.execute(
-                            "SELECT bin_file FROM nodes WHERE parent_id = ? LIMIT 1",
-                            (parent_id,),
-                        ).fetchone()
-                        if child_row is not None:
+                        # Branching ancestor — set redirect target from first one
+                        if redirect_target is None:
+                            child_row = db.execute(
+                                "SELECT bin_file FROM nodes WHERE parent_id = ? LIMIT 1",
+                                (parent_id,),
+                            ).fetchone()
+                            if child_row is not None:
+                                redirect_target = child_row["bin_file"]
+                        # Update this ancestor to redirect target
+                        if redirect_target is not None:
                             db.execute(
                                 "UPDATE nodes SET bin_file = ? WHERE id = ?",
-                                (child_row["bin_file"], parent_id),
+                                (redirect_target, parent_id),
                             )
-                        break
-                    # Budget check: if already under budget after this deletion,
-                    # don't cascade further — leave the parent in place
-                    total_bytes = chosen_cache._total_bytes_in_db(db)
-                    total_nodes = int(db.execute("SELECT COUNT(*) FROM nodes").fetchone()[0])
-                    if (max_bytes is None or total_bytes <= max_bytes) and \
-                       (max_nodes is None or total_nodes <= max_nodes):
-                        break
-                    cur_id = parent_id
+                        # Budget check after redirect
+                        total_bytes = chosen_cache._total_bytes_in_db(db)
+                        total_nodes = int(db.execute("SELECT COUNT(*) FROM nodes").fetchone()[0])
+                        if (max_bytes is None or total_bytes <= max_bytes) and \
+                           (max_nodes is None or total_nodes <= max_nodes):
+                            break
+                        cur_id = parent_id
+                    else:
+                        # Parent is now a leaf — continue cascade
+                        # Budget check before next deletion
+                        total_bytes = chosen_cache._total_bytes_in_db(db)
+                        total_nodes = int(db.execute("SELECT COUNT(*) FROM nodes").fetchone()[0])
+                        if (max_bytes is None or total_bytes <= max_bytes) and \
+                           (max_nodes is None or total_nodes <= max_nodes):
+                            break
+                        cur_id = parent_id
                 # Unlink old files that dropped to zero refs
                 for bf, bp in bins_to_check:
                     remaining = int(db.execute(
@@ -927,11 +939,14 @@ class PrefixCache:
                 if dry_run:
                     # Simulate only one candidate in dry-run to avoid fake totals.
                     break
-                # Cascade: delete the leaf, then walk up deleting parents that
-                # become leaves too. Stop at a branching ancestor and redirect
-                # it to a surviving child's file so all old files can unlink.
+                # Cascade: delete the leaf, then walk up to root. Delete parents
+                # that become leaves. At the first branching ancestor (still has
+                # children), record its surviving child's file as redirect target
+                # and update it. Continue to root — any further branching ancestors
+                # also get redirected to the same target.
                 cur_id = node["id"]
                 bins_to_check = []  # (bin_file, absolute_path) pairs
+                redirect_target = None  # set at first branching ancestor
                 while True:
                     cur = db.execute(
                         "SELECT * FROM nodes WHERE id = ?", (cur_id,)
@@ -940,7 +955,6 @@ class PrefixCache:
                         break
                     bins_to_check.append((cur["bin_file"], self.absolute_bin_path(cur["bin_file"])))
                     db.execute("DELETE FROM nodes WHERE id = ?", (cur_id,))
-                    # Check if parent is now a leaf
                     parent_id = cur["parent_id"]
                     if parent_id is None:
                         break
@@ -949,26 +963,36 @@ class PrefixCache:
                         (parent_id,),
                     ).fetchone()[0])
                     if child_count > 0:
-                        # Parent still has children — redirect it to a surviving
-                        # child's file, then stop
-                        child_row = db.execute(
-                            "SELECT bin_file FROM nodes WHERE parent_id = ? LIMIT 1",
-                            (parent_id,),
-                        ).fetchone()
-                        if child_row is not None:
+                        # Branching ancestor — set redirect target from first one
+                        if redirect_target is None:
+                            child_row = db.execute(
+                                "SELECT bin_file FROM nodes WHERE parent_id = ? LIMIT 1",
+                                (parent_id,),
+                            ).fetchone()
+                            if child_row is not None:
+                                redirect_target = child_row["bin_file"]
+                        # Update this ancestor to redirect target
+                        if redirect_target is not None:
                             db.execute(
                                 "UPDATE nodes SET bin_file = ? WHERE id = ?",
-                                (child_row["bin_file"], parent_id),
+                                (redirect_target, parent_id),
                             )
-                        break
-                    # Budget check: if already under budget after this deletion,
-                    # don't cascade further — leave the parent in place
-                    total_bytes = self._total_bytes_in_db(db)
-                    total_nodes = int(db.execute("SELECT COUNT(*) FROM nodes").fetchone()[0])
-                    if (max_bytes is None or total_bytes <= max_bytes) and \
-                       (max_nodes is None or total_nodes <= max_nodes):
-                        break
-                    cur_id = parent_id
+                        # Budget check after redirect
+                        total_bytes = self._total_bytes_in_db(db)
+                        total_nodes = int(db.execute("SELECT COUNT(*) FROM nodes").fetchone()[0])
+                        if (max_bytes is None or total_bytes <= max_bytes) and \
+                           (max_nodes is None or total_nodes <= max_nodes):
+                            break
+                        cur_id = parent_id
+                    else:
+                        # Parent is now a leaf — continue cascade
+                        # Budget check before next deletion
+                        total_bytes = self._total_bytes_in_db(db)
+                        total_nodes = int(db.execute("SELECT COUNT(*) FROM nodes").fetchone()[0])
+                        if (max_bytes is None or total_bytes <= max_bytes) and \
+                           (max_nodes is None or total_nodes <= max_nodes):
+                            break
+                        cur_id = parent_id
                 # Unlink old files that dropped to zero refs
                 for bf, bp in bins_to_check:
                     remaining = int(db.execute(
