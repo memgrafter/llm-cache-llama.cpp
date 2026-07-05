@@ -14,7 +14,9 @@ tags: [proxy, slot-routing, prefix-cache, autosave]
 
 When a conversation grows over multiple turns, the proxy's prefix cache lookup finds a match that covers only ~90% of the loaded context rather than the full amount. This means llama.cpp has to recompute ~10% of tokens that were already cached.
 
-**Observed**: In the latest 240k ctx session, slot 0 reached 143003 tokens but each request's lookup matched a node ~90% of that size, forcing recomputation of the gap.
+**Observed**: On the main coding agent session with a ~160k token cache loaded in slot 0, every request's prefix lookup matches only ~90% (~144k) of the loaded context. The remaining ~10% (~16k tokens) get recomputed each turn, even though they're already in the slot's KV cache.
+
+With 240k ctx and slot 0 at 143003 tokens, this means ~16k tokens are being wasted per request — significant overhead for a long-running session.
 
 **Theories**:
 1. Autosave doesn't save a new KV bin file every round — it may be reusing an older bin, so the trie's newest node points to stale data
