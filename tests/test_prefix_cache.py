@@ -226,65 +226,80 @@ class PrefixCacheTests(unittest.TestCase):
             self.assertLessEqual(estimate, 2000)
 
 
-    def test_prune_redirects_ancestors_before_unlink(self):
-        """When pruning a leaf whose file is shared by ancestors, redirect
-        ancestors to the largest alternative file and then unlink."""
+    def test_update_ancestors_bin_points_to_descendant_file(self):
         with tempfile.TemporaryDirectory() as d:
             cache = prefix_cache.PrefixCache(pathlib.Path(d))
             cache.init()
 
-            # Chain where gp and parent share child's file (simulating lcl-9opm state)
-            # gp (10t) → parent (50t) → child (100t, all share child.bin)
-            # Plus a larger sibling (200t, large.bin) for redirect target
-            gp_node = self._node([1] * 10, label="gp", bin_file="child.bin")
-            gp_id, _ = prefix_cache.node_id_for([1] * 10)
-            p_node = self._node([1] * 50, label="parent", parent_id=gp_id, bin_file="child.bin")
-            p_id, _ = prefix_cache.node_id_for([1] * 50)
-            c_node = self._node([1] * 100, label="child", parent_id=p_id, bin_file="child.bin")
-
-            # Larger sibling (not in chain) — will be the redirect target
-            large_node = self._node([2] * 200, label="large", bin_file="large.bin")
+            # Create a chain: grandparent (10 tokens) → parent (50 tokens) → child (100 tokens)
+            gp_node = self._node([1] * 10, label="gp", bin_file="gp.bin")
+            p_id, _ = prefix_cache.node_id_for([1] * 10)
+            p_node = self._node([1] * 50, label="parent", parent_id=p_id, bin_file="parent.bin")
+            c_id, _ = prefix_cache.node_id_for([1] * 50)
+            c_node = self._node([1] * 100, label="child", parent_id=c_id, bin_file="child.bin")
 
             cache.insert_node(gp_node)
             cache.insert_node(p_node)
             cache.insert_node(c_node)
-            cache.insert_node(large_node)
 
+            # Create fake bin files so unlink works
+            (cache.cache_dir / "gp.bin").write_bytes(b"x")
+            (cache.cache_dir / "parent.bin").write_bytes(b"x")
             (cache.cache_dir / "child.bin").write_bytes(b"x")
-            (cache.cache_dir / "large.bin").write_bytes(b"x")
 
-            # total_bytes groups by bin_file: child.bin(123) + large.bin(123) = 246
-            # max_bytes=200 forces prune. After pruning child, ancestors redirect
-            # to large.bin, child.bin unlinked → total = 123 < 200, done.
-            removed = cache.prune(max_bytes=200, max_nodes=None, dry_run=False)
-            self.assertEqual(len(removed), 1)  # child pruned first
-            self.assertFalse((cache.cache_dir / "child.bin").exists())  # file freed
-            # gp and parent redirected to large.bin
-            self.assertEqual(cache.get_node(gp_id)["bin_file"], "large.bin")
-            self.assertEqual(cache.get_node(p_id)["bin_file"], "large.bin")
+            # Before update: ancestors point to their own files
+            self.assertEqual(cache.get_node(p_id)["bin_file"], "gp.bin")
 
-    def test_prune_unlinks_when_no_shared_refs(self):
-        """When pruning a leaf with no shared file refs, unlink immediately."""
+            child_id, _ = prefix_cache.node_id_for([1] * 100)
+            cache.update_ancestors_bin(child_id, "child.bin")
+
+            # After update: entire ancestor chain points to child's file
+            self.assertEqual(cache.get_node(p_id)["bin_file"], "child.bin")  # grandparent
+            parent_id, _ = prefix_cache.node_id_for([1] * 50)
+            self.assertEqual(cache.get_node(parent_id)["bin_file"], "child.bin")  # parent
+
+            # Old gp.bin and parent.bin should be unlinked (no other node references them)
+            self.assertFalse((cache.cache_dir / "gp.bin").exists())
+            self.assertFalse((cache.cache_dir / "parent.bin").exists())
+            # child.bin should still exist
+            self.assertTrue((cache.cache_dir / "child.bin").exists())
+
+    def test_update_ancestors_bin_keeps_shared_file(self):
         with tempfile.TemporaryDirectory() as d:
             cache = prefix_cache.PrefixCache(pathlib.Path(d))
             cache.init()
 
+            # Grandparent (gp.bin) → Parent (shared.bin) → Child (child.bin)
+            # Plus a sibling node that also references shared.bin
             gp_node = self._node([1] * 10, label="gp", bin_file="gp.bin")
-            gp_id, _ = prefix_cache.node_id_for([1] * 10)
-            c_node = self._node([1] * 50, label="child", parent_id=gp_id, bin_file="child.bin")
+            p_id, _ = prefix_cache.node_id_for([1] * 10)
+            p_node = self._node([1] * 50, label="parent", parent_id=p_id, bin_file="shared.bin")
+            c_id, _ = prefix_cache.node_id_for([1] * 50)
+            c_node = self._node([1] * 100, label="child", parent_id=c_id, bin_file="child.bin")
+
+            # Sibling node also points to shared.bin (not in ancestor chain)
+            sib_node = self._node([2] * 50, label="sibling", bin_file="shared.bin")
 
             cache.insert_node(gp_node)
+            cache.insert_node(p_node)
             cache.insert_node(c_node)
+            cache.insert_node(sib_node)
 
             (cache.cache_dir / "gp.bin").write_bytes(b"x")
+            (cache.cache_dir / "shared.bin").write_bytes(b"x")
             (cache.cache_dir / "child.bin").write_bytes(b"x")
 
-            # max_bytes=123 allows 1 node but not 2
-            removed = cache.prune(max_bytes=123, max_nodes=None, dry_run=False)
-            self.assertEqual(len(removed), 1)  # child pruned
-            self.assertFalse((cache.cache_dir / "child.bin").exists())  # file freed
-            # gp still points to its own file
-            self.assertEqual(cache.get_node(gp_id)["bin_file"], "gp.bin")
+            child_id, _ = prefix_cache.node_id_for([1] * 100)
+            cache.update_ancestors_bin(child_id, "child.bin")
+
+            # Ancestor chain updated to child.bin
+            self.assertEqual(cache.get_node(p_id)["bin_file"], "child.bin")
+            parent_id, _ = prefix_cache.node_id_for([1] * 50)
+            self.assertEqual(cache.get_node(parent_id)["bin_file"], "child.bin")
+
+            # gp.bin unlinked (no refs), shared.bin kept (sibling still references it)
+            self.assertFalse((cache.cache_dir / "gp.bin").exists())
+            self.assertTrue((cache.cache_dir / "shared.bin").exists())
 
 
 if __name__ == "__main__":
