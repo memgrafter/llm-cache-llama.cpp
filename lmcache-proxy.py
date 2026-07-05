@@ -109,8 +109,30 @@ class SlotManager:
         self.poll_interval = poll_interval
         self._running = False
         self._thread = None
-        self._loaded_slots = set()  # slot IDs that currently have KV loaded
+        self._slot_hash: dict[int, str] = {}  # slot_id -> prompt hash of loaded KV
+        self._slot_time: dict[int, float] = {}  # slot_id -> last used timestamp (for LRU)
         self._lock = Lock()
+
+    def get_best_slot(self, prompt: str) -> int | None:
+        """Return the slot whose loaded KV best matches the prompt hash, or None."""
+        h = self.cache._hash_prefix(prompt)
+        with self._lock:
+            for sid, sh in self._slot_hash.items():
+                if sh == h:
+                    return sid
+        return None
+
+    def lru_slot(self) -> int | None:
+        """Return the slot_id with the oldest last-used time (for eviction)."""
+        with self._lock:
+            if not self._slot_time:
+                return None
+            return min(self._slot_time, key=self._slot_time.get)
+
+    def update_slot_time(self, slot_id: int):
+        """Record that a slot was used at the current time."""
+        with self._lock:
+            self._slot_time[slot_id] = time.monotonic()
 
     def start(self):
         """Start the slot manager background thread."""
@@ -146,7 +168,9 @@ class SlotManager:
             # For each idle slot, try to load a KV state
             for slot_info in idle_slots:
                 slot_id = slot_info["id"]
-                if slot_id in self._loaded_slots:
+                with self._lock:
+                    already_loaded = slot_id in self._slot_hash
+                if already_loaded:
                     continue
 
                 # Get available prompts from loaded slots' history
@@ -168,8 +192,10 @@ class SlotManager:
                     log.info("loading KV from %s into slot %d", kv_path, slot_id)
                     result = _restore_slot(slot_id, kv_path, self.llama_server, self.llama_port)
                     if result:
+                        ph = self.cache._hash_prefix(prompt_text)
                         with self._lock:
-                            self._loaded_slots.add(slot_id)
+                            self._slot_hash[slot_id] = ph
+                            self._slot_time[slot_id] = time.monotonic()
                         log.info("KV restored into slot %d", slot_id)
                         break
 
@@ -184,6 +210,7 @@ class LMCacheHandler(BaseHTTPRequestHandler):
     llama_port = 8081
     proxy_port = 8090
     cache_dir_obj: KVCache = None  # type: ignore[assignment]
+    slot_manager: SlotManager | None = None  # type: ignore[assignment]
 
     def _forward(self, method: str, path: str, body_bytes: bytes):
         """Forward request to llama.cpp server."""
@@ -234,6 +261,16 @@ class LMCacheHandler(BaseHTTPRequestHandler):
         if prompts:
             log.debug("request prompts: %s", prompts[:1])  # just first one
 
+            # Route to best matching slot by prompt hash
+            sm = self.slot_manager
+            if sm is not None:
+                target = sm.get_best_slot(prompts[0])
+                if target is not None:
+                    body["id_slot"] = target
+                    body_bytes = json.dumps(body).encode("utf-8")
+                    sm.update_slot_time(target)
+                    log.debug("routed to slot %d", target)
+
         # Forward to llama.cpp server
         return self._forward(method, path, body_bytes)
 
@@ -268,14 +305,15 @@ def main():
     # Initialize cache
     cache = KVCache(args.cache_dir, top_k=args.top_k)
 
+    # Initialize slot manager
+    slot_manager = SlotManager(args.server, args.llama_port, cache, poll_interval=args.poll_interval)
+
     # Set handler class attributes
     LMCacheHandler.llama_server = args.server
     LMCacheHandler.llama_port = args.llama_port
     LMCacheHandler.proxy_port = args.port
     LMCacheHandler.cache_dir_obj = cache
-
-    # Initialize slot manager
-    slot_manager = SlotManager(args.server, args.llama_port, cache, poll_interval=args.poll_interval)
+    LMCacheHandler.slot_manager = slot_manager
 
     log.info("Starting LMCache proxy on %s:%d", args.host, args.port)
     log.info("llama.cpp server: %s:%d", args.server, args.llama_port)
