@@ -253,8 +253,6 @@ class LMCacheHandler(BaseHTTPRequestHandler):
     prefix_cache_enabled = True
     auto_save_enabled = True
     min_save_tokens = 256
-    min_match_tokens = 5000  # minimum tokens a match must cover to overwrite a loaded slot
-    min_match_ratio = 0.8   # minimum fraction of request tokens a match must cover
     max_cache_bytes = 2 * GIB
     min_free_bytes = 512 * MIB
     strict_prefix_restore = True
@@ -725,12 +723,9 @@ class LMCacheHandler(BaseHTTPRequestHandler):
                         break  # found deepest match for this slot, move on
 
             if best_slot is not None:
-                if best_shared_tok >= self.min_match_tokens:
-                    slot_tok = self.slot_state.tokens_for(best_slot)
-                    if slot_tok is not None and req_tokens >= slot_tok:
-                        self.slot_state.touch(best_slot)
-                        return best_slot
-                elif req_tokens >= int(best_shared_tok * self.min_match_ratio):
+                # Reuse slot only if request covers the slot's loaded prefix.
+                slot_tok = self.slot_state.tokens_for(best_slot)
+                if slot_tok is not None and req_tokens >= slot_tok:
                     self.slot_state.touch(best_slot)
                     return best_slot
 
@@ -773,12 +768,9 @@ class LMCacheHandler(BaseHTTPRequestHandler):
                             break
 
             if best_slot is not None:
-                if best_shared_tok >= self.min_match_tokens:
-                    slot_tok = self.slot_state.tokens_for(best_slot)
-                    if slot_tok is not None and req_tokens >= slot_tok:
-                        self.slot_state.touch(best_slot)
-                        return best_slot
-                elif req_tokens >= int(best_shared_tok * self.min_match_ratio):
+                # Reuse slot only if request covers the slot's loaded prefix.
+                slot_tok = self.slot_state.tokens_for(best_slot)
+                if slot_tok is not None and req_tokens >= slot_tok:
                     self.slot_state.touch(best_slot)
                     return best_slot
 
@@ -811,7 +803,7 @@ class LMCacheHandler(BaseHTTPRequestHandler):
 
         Returns the target slot_id (for id_slot injection), or None in single-slot mode.
         In multi-slot mode, may also return None if the match is too short to justify
-        overwriting a loaded slot (min_match_tokens / min_match_ratio threshold).
+        overwriting a loaded slot.
         """
         cache = self.prefix_cache_obj
         if cache is None:
@@ -1461,10 +1453,6 @@ def main():
         help="Number of llama.cpp slots (--parallel). When set, enables multi-slot routing; "
              "without it the proxy uses a single hardcoded slot_id")
     parser.add_argument("--min-save-tokens", type=int, default=256, help="Minimum tokens before autosaving a prefix node")
-    parser.add_argument("--min-match-tokens", type=int, default=5000,
-        help="Minimum token match length to overwrite a loaded slot (default: 5000)")
-    parser.add_argument("--min-match-ratio", type=float, default=0.8,
-        help="Minimum fraction of request tokens a match must cover (default: 0.8)")
     parser.add_argument("--prefix-cache-max-bytes", type=parse_bytes, default=8 * GIB, help="Max prefix cache bytes before pruning (default: 8GiB)")
     parser.add_argument("--prefix-cache-min-free-bytes", type=parse_bytes, default=512 * MIB, help="Minimum filesystem free bytes before autosave (default: 512MiB)")
     parser.add_argument("--no-prefix-cache", action="store_true", help="Disable trie-backed prefix cache")
@@ -1500,8 +1488,6 @@ def main():
     LMCacheHandler.auto_save_enabled = not args.no_auto_save
     LMCacheHandler.generated_prefix_enabled = not args.no_generated_prefix_cache
     LMCacheHandler.min_save_tokens = args.min_save_tokens
-    LMCacheHandler.min_match_tokens = args.min_match_tokens
-    LMCacheHandler.min_match_ratio = args.min_match_ratio
     LMCacheHandler.max_cache_bytes = args.prefix_cache_max_bytes
     LMCacheHandler.min_free_bytes = args.prefix_cache_min_free_bytes
     LMCacheHandler.strict_prefix_restore = not args.allow_exact_prefix_restore
