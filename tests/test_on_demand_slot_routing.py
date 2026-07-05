@@ -41,24 +41,26 @@ class TestPickSlotForRestore(unittest.TestCase):
     """Test _pick_slot_for_restore in the on-demand proxy."""
 
     def test_reuses_slot_with_matching_large_node(self):
-        """Slot with node >= 5000 tok and full coverage is reused."""
+        """Slot with node >= 5000 tok: request must exhaust slot's prefix (req >= slot_tok)."""
         state = SlotState()
-        state.record(0, "node-A", 6000)
+        state.record(0, "node-A", 4000)
         h = make_handler(state=state, discover_slots=[{"id": 0, "is_busy": False}])
         node = {"id": "node-A", "token_count": 6000}
 
-        result = h._pick_slot_for_restore(node, 4000)
+        # Request (6000) covers slot's prefix (4000) → reuse
+        result = h._pick_slot_for_restore(node, 6000)
         self.assertEqual(result, 0)
 
-    def test_slot_not_reused_falls_through_to_eviction(self):
-        """Slot with node >= 5000 tok but slot tokens < req tokens is NOT reused,
-        but eviction kicks in and returns a slot."""
+    def test_slot_not_exhausted_falls_through_to_eviction(self):
+        """Slot with node >= 5000 tok but request doesn't exhaust slot prefix → not reused,
+        eviction kicks in and returns a slot."""
         state = SlotState()
-        state.record(0, "node-A", 4000)  # slot has fewer tokens than request
+        state.record(0, "node-A", 6000)  # slot has more tokens than request
         h = make_handler(state=state, discover_slots=[{"id": 0, "is_busy": True}], mock_evict=True)
-        node = {"id": "node-A", "token_count": 5000}
+        node = {"id": "node-A", "token_count": 6000}
 
-        result = h._pick_slot_for_restore(node, 6000)
+        # Request (4000) doesn't cover slot prefix (6000) → not reused, falls to eviction
+        result = h._pick_slot_for_restore(node, 4000)
         self.assertEqual(result, 0)  # eviction returns slot 0
         h._evict_slot.assert_called_with(0)
 
