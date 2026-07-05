@@ -1370,6 +1370,13 @@ class LMCacheHandler(BaseHTTPRequestHandler):
             cache.insert_node(generated_node)
             inserted_nodes.append(generated_node_id)
 
+        # Update ancestor nodes to point to the new descendant's bin file.
+        # This lets ancestors be restored from the latest saved file (which
+        # contains their prefix as a subset), enabling more aggressive pruning
+        # of intermediate files. Orphaned old files are unlinked immediately.
+        if primary_bin_node_id is not None:
+            cache.update_ancestors_bin(primary_bin_node_id, bin_file)
+
         # Budget enforcement is handled proactively by _ensure_storage_room
         # before each autosave. Running prune here would delete the nodes we
         # just created (hits=0, last_used=null → LRU candidates), causing

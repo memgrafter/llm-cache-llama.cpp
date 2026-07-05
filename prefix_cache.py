@@ -489,6 +489,52 @@ class PrefixCache:
             )
             db.commit()
 
+    def update_ancestors_bin(self, start_node_id: str, new_bin_file: str) -> None:
+        """Walk ancestor chain from start_node_id, updating each ancestor's
+        bin_file to point to the new descendant's file.
+
+        Immediately unlinks any old bin files that drop to zero references.
+        """
+        with contextlib.closing(self.connect()) as db:
+            node = db.execute(
+                "SELECT * FROM nodes WHERE id = ?", (start_node_id,)
+            ).fetchone()
+            while node is not None:
+                parent_row = db.execute(
+                    "SELECT * FROM nodes WHERE id = ?",
+                    (node["parent_id"],),
+                ).fetchone() if node["parent_id"] else None
+                if parent_row is None:
+                    break
+                old_bin = parent_row["bin_file"]
+                if old_bin != new_bin_file:
+                    # Update ancestor to point to descendant's file
+                    db.execute(
+                        "UPDATE nodes SET bin_file = ? WHERE id = ?",
+                        (new_bin_file, parent_row["id"]),
+                    )
+                    # Check if old file is now unreferenced
+                    remaining = int(db.execute(
+                        "SELECT COUNT(*) FROM nodes WHERE bin_file = ?",
+                        (old_bin,),
+                    ).fetchone()[0])
+                    if remaining == 0:
+                        old_path = self.absolute_bin_path(old_bin)
+                        try:
+                            old_path.unlink()
+                        except FileNotFoundError:
+                            pass
+                        log.info(
+                            "prefix-cache unlinked orphaned bin %s after ancestor update", old_bin
+                        )
+                    else:
+                        log.debug(
+                            "prefix-cache kept %s (%d remaining refs) after ancestor update",
+                            old_bin, remaining,
+                        )
+                    db.commit()
+                node = parent_row
+
     def list_nodes(self) -> list[dict[str, Any]]:
         with contextlib.closing(self.connect()) as db:
             rows = db.execute(
