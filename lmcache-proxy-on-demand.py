@@ -705,7 +705,7 @@ class LMCacheHandler(BaseHTTPRequestHandler):
         # min_match_ratio of the request's token count (whichever is lower).
         if node is not None:
             node_tok = int(node.get("token_count", 0))
-            threshold = min(self.min_match_tokens, int(req_tokens * self.min_match_ratio))
+            threshold = max(self.min_match_tokens, int(req_tokens * self.min_match_ratio))
             if node_tok >= threshold:
                 # Match is long enough — pick the LRU slot to overwrite
                 lru = self.slot_state.lru_slot()
