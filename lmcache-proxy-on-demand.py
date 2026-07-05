@@ -691,24 +691,34 @@ class LMCacheHandler(BaseHTTPRequestHandler):
         if self.slot_state is None:
             return self.slot_id
 
-        # If we have a node, check if any tracked slot already has it.
-        # Only reuse the slot if the request exhausts the slot's loaded prefix:
-        #   - node >= 5000 tok → request must cover the slot's full loaded
-        #     prefix (req tokens >= slot tokens), then use it
-        #   - node < 5000 tok → request just needs to cover 80% of it
-        #     (small cache, not worth protecting)
+        # If we have a node, check if any tracked slot holds a prefix of it.
+        # Walk the matched node's ancestor chain — if a slot holds an ancestor
+        # (or the node itself), that slot still has a valid KV prefix.
+        # Only reuse if the request exhausts the slot's loaded prefix:
+        #   - node >= 5000 tok → req tokens >= slot tokens
+        #   - node < 5000 tok → request covers 80% of it
         if node is not None and node.get("id"):
             node_tok = int(node.get("token_count", 0))
+            # Build set of ancestor node ids (including the node itself)
+            ancestors = {node["id"]}
+            cur_id = node.get("parent_id")
+            while cur_id:
+                ancestors.add(cur_id)
+                cur_node = self.prefix_cache_obj.get_node(cur_id) if self.prefix_cache_obj else None
+                cur_id = cur_node.get("parent_id") if cur_node else None
+
             if node_tok >= self.min_match_tokens:
                 for sid in self.slot_state.all_slot_ids():
-                    if self.slot_state.node_for(sid) == node["id"]:
+                    slot_node = self.slot_state.node_for(sid)
+                    if slot_node in ancestors:
                         slot_tok = self.slot_state.tokens_for(sid)
                         if slot_tok is not None and req_tokens >= slot_tok:
                             self.slot_state.touch(sid)
                             return sid
             elif req_tokens >= int(node_tok * self.min_match_ratio):
                 for sid in self.slot_state.all_slot_ids():
-                    if self.slot_state.node_for(sid) == node["id"]:
+                    slot_node = self.slot_state.node_for(sid)
+                    if slot_node in ancestors:
                         self.slot_state.touch(sid)
                         return sid
 
