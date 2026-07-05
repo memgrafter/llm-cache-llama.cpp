@@ -244,5 +244,64 @@ class TestThreadingLock(unittest.TestCase):
         self.assertTrue(hasattr(_lmcp.LMCacheHandler, '_cache_lock'))
 
 
+class TestTryMakeRoom(unittest.TestCase):
+    """Tests for _try_make_room_for — erasing another slot to make room for a restore."""
+
+    def _make_handler(self):
+        """Create a minimal handler-like object with the needed attributes."""
+        class FakeHandler:
+            pass
+        h = FakeHandler()
+        h.slot_state = _lmcp.SlotState()
+        h.llama_server = "localhost"
+        h.llama_port = 8081
+        # Bind the method so we can call it
+        h._try_make_room_for = _lmcp.LMCacheHandler._try_make_room_for.__get__(h)
+        return h
+
+    def test_erases_small_slot_first(self):
+        """Prefers erasing a slot with < 10000 tokens."""
+        h = self._make_handler()
+        h.slot_state.record(0, "big-node", 50000)
+        h.slot_state.record(1, "small-node", 5000)
+        with unittest.mock.patch.object(_lmcp, "_erase_slot") as erase:
+            result = h._try_make_room_for(0, {"token_count": 50000})
+        self.assertEqual(result, 1)
+        erase.assert_called_once_with(1, "localhost", 8081)
+
+    def test_erases_lru_when_no_small_slot(self):
+        """Falls back to LRU when all slots have >= 10000 tokens."""
+        h = self._make_handler()
+        h.slot_state.record(2, "big-node-b", 40000)   # older → LRU
+        time.sleep(0.01)
+        h.slot_state.record(0, "big-node-a", 50000)  # target, newer
+        with unittest.mock.patch.object(_lmcp, "_erase_slot") as erase:
+            result = h._try_make_room_for(0, {"token_count": 50000})
+        self.assertEqual(result, 2)
+        erase.assert_called_once_with(2, "localhost", 8081)
+
+    def test_never_erases_target_slot(self):
+        """Never erases the target slot itself."""
+        h = self._make_handler()
+        h.slot_state.record(0, "target-node", 5000)  # target
+        h.slot_state.record(1, "other-node", 5000)
+        with unittest.mock.patch.object(_lmcp, "_erase_slot") as erase:
+            result = h._try_make_room_for(1, {"token_count": 50000})
+        self.assertEqual(result, 0)  # erases slot 0, not target slot 1
+
+    def test_returns_none_when_only_target_tracked(self):
+        """Returns None when only the target slot is tracked."""
+        h = self._make_handler()
+        h.slot_state.record(0, "only-node", 50000)
+        result = h._try_make_room_for(0, {"token_count": 50000})
+        self.assertIsNone(result)
+
+    def test_returns_none_when_no_slots_tracked(self):
+        """Returns None when no slots are tracked."""
+        h = self._make_handler()
+        result = h._try_make_room_for(0, {"token_count": 50000})
+        self.assertIsNone(result)
+
+
 if __name__ == "__main__":
     unittest.main()

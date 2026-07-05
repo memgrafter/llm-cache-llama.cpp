@@ -838,7 +838,22 @@ class LMCacheHandler(BaseHTTPRequestHandler):
                     self.slot_state.record(slot, node["id"], int(node.get("token_count", 0)))
                 log.info("prefix-cache restored node %s (%s tokens) via %s into slot %d",
                          node["id"], node["token_count"], via, slot)
-            return slot if self.slot_state is not None else None
+                return slot if self.slot_state is not None else None
+            # Restore failed (e.g. KV cache full — not enough cells for this slot).
+            # Try to make room by erasing a different loaded slot, then retry.
+            if self.slot_state is not None:
+                other = self._try_make_room_for(slot, node)
+                if other is not None:
+                    result = _restore_slot(slot, node["bin_file"], self.llama_server, self.llama_port)
+                    if result:
+                        ctx.restored_node_id = node["id"]
+                        ctx.restored_via = via
+                        self.slot_state.record(slot, node["id"], int(node.get("token_count", 0)))
+                        log.info("prefix-cache restored node %s (%s tokens) via %s into slot %d (after evicting slot %d)",
+                                 node["id"], node["token_count"], via, slot, other)
+                        return slot
+            log.warning("prefix-cache restore failed for slot %d — forwarding without cache", slot)
+            return None
 
         for anchor in sorted(ctx.anchors, key=lambda a: len(a.tokens), reverse=True):
             anchor_node = cache.lookup_materialized_anchor(label=anchor.config.label,
@@ -859,7 +874,24 @@ class LMCacheHandler(BaseHTTPRequestHandler):
                     log.info("prefix-cache restored node %s (%s tokens) via %s into slot %d",
                              anchor_node["id"], anchor_node["token_count"],
                              ctx.restored_via, slot)
-                return slot if self.slot_state is not None else None
+                    return slot
+                # Restore failed — try to make room
+                if self.slot_state is not None:
+                    other = self._try_make_room_for(slot, anchor_node)
+                    if other is not None:
+                        result = _restore_slot(slot, anchor_node["bin_file"],
+                                               self.llama_server, self.llama_port)
+                        if result:
+                            ctx.restored_node_id = anchor_node["id"]
+                            ctx.restored_via = f"anchor:{anchor.config.label}"
+                            self.slot_state.record(slot, anchor_node["id"],
+                                                   int(anchor_node.get("token_count", 0)))
+                            log.info("prefix-cache restored node %s (%s tokens) via %s into slot %d (after evicting slot %d)",
+                                     anchor_node["id"], anchor_node["token_count"],
+                                     ctx.restored_via, slot, other)
+                            return slot
+                log.warning("prefix-cache anchor restore failed for slot %d", slot)
+                continue
 
             node = self._materialize_anchor_once(anchor)
             if node:
@@ -985,6 +1017,33 @@ class LMCacheHandler(BaseHTTPRequestHandler):
             return None
         tracked = set(self.slot_state.all_slot_ids()) if self.slot_state else set()
         return [sid for sid in idle if sid not in tracked]
+
+    def _try_make_room_for(self, target_slot: int, node: dict) -> int | None:
+        """Try to erase another slot to make room for restoring into target_slot.
+
+        Returns the erased slot id, or None if no suitable slot was found.
+        Prefers erasing the slot with the smallest loaded prefix (< 10000 tok),
+        then falls back to the LRU tracked slot. Never erases the target slot itself.
+        """
+        if self.slot_state is None:
+            return None
+        candidates = [sid for sid in self.slot_state.all_slot_ids() if sid != target_slot]
+        if not candidates:
+            return None
+        # Prefer erasing a slot with a small loaded node
+        for sid in candidates:
+            tok = self.slot_state.tokens_for(sid)
+            if tok is not None and tok < 10000:
+                _erase_slot(sid, self.llama_server, self.llama_port)
+                self.slot_state.forget(sid)
+                return sid
+        # Otherwise evict the LRU slot
+        lru = self.slot_state.lru_slot()
+        if lru is not None and lru != target_slot:
+            _erase_slot(lru, self.llama_server, self.llama_port)
+            self.slot_state.forget(lru)
+            return lru
+        return None
 
     @staticmethod
     def _text_fragments_from_event(obj) -> list[str]:
