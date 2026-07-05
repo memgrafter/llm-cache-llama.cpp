@@ -725,12 +725,12 @@ class LMCacheHandler(BaseHTTPRequestHandler):
                         break  # found deepest match for this slot, move on
 
             if best_slot is not None:
-                if node_tok >= self.min_match_tokens:
+                if best_shared_tok >= self.min_match_tokens:
                     slot_tok = self.slot_state.tokens_for(best_slot)
                     if slot_tok is not None and req_tokens >= slot_tok:
                         self.slot_state.touch(best_slot)
                         return best_slot
-                elif req_tokens >= int(node_tok * self.min_match_ratio):
+                elif req_tokens >= int(best_shared_tok * self.min_match_ratio):
                     self.slot_state.touch(best_slot)
                     return best_slot
 

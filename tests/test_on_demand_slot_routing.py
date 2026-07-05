@@ -181,6 +181,40 @@ class TestPickSlotForRestore(unittest.TestCase):
         result = h._pick_slot_for_restore(node, 100000)
         self.assertEqual(result, 0)
 
+    def test_shallow_ancestor_not_reused(self):
+        """When slot holds only a shallow ancestor (< 5000 tok), 80% ratio applies.
+        If request doesn't cover 80% of the shared prefix, don't reuse."""
+        state = SlotState()
+        state.record(0, "node-root", 100)  # tiny root node
+        nodes = {
+            "node-root": {"id": "node-root", "parent_id": None, "token_count": 100},
+            "node-A": {"id": "node-A", "parent_id": "node-root", "token_count": 5000},
+        }
+        h = make_handler(state=state, discover_slots=[{"id": 0, "is_busy": True}], mock_evict=True, nodes=nodes)
+        node = {"id": "node-A", "parent_id": "node-root", "token_count": 5000}
+
+        # shared prefix is 100 tok (< 5000) → 80% ratio: req >= 80
+        # request (3000) >= 80 → true, so slot IS reused
+        result = h._pick_slot_for_restore(node, 3000)
+        self.assertEqual(result, 0)
+
+    def test_shallow_ancestor_below_ratio(self):
+        """When shared prefix < 5000 and request below 80% of it, don't reuse."""
+        state = SlotState()
+        state.record(0, "node-root", 100)
+        nodes = {
+            "node-root": {"id": "node-root", "parent_id": None, "token_count": 100},
+            "node-A": {"id": "node-A", "parent_id": "node-root", "token_count": 5000},
+        }
+        h = make_handler(state=state, discover_slots=[{"id": 0, "is_busy": True}], mock_evict=True, nodes=nodes)
+        node = {"id": "node-A", "parent_id": "node-root", "token_count": 5000}
+
+        # shared prefix is 100 tok (< 5000) → 80% ratio: req >= 80
+        # request (50) < 80 → don't reuse, falls to eviction
+        result = h._pick_slot_for_restore(node, 50)
+        self.assertEqual(result, 0)  # eviction returns slot 0
+        h._evict_slot.assert_called_with(0)
+
     def test_idle_slot_used_before_eviction(self):
         """Idle slots are preferred over eviction."""
         state = SlotState()
