@@ -34,6 +34,7 @@ def make_handler(state=None, discover_slots=None, mock_evict=False):
     # Bind the actual methods
     h._pick_slot_for_restore = _lmcp.LMCacheHandler._pick_slot_for_restore.__get__(h, FakeHandler)
     h._idle_slots = _lmcp.LMCacheHandler._idle_slots.__get__(h, FakeHandler)
+    h._empty_slots = _lmcp.LMCacheHandler._empty_slots.__get__(h, FakeHandler)
     return h
 
 

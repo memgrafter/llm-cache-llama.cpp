@@ -712,10 +712,10 @@ class LMCacheHandler(BaseHTTPRequestHandler):
                         self.slot_state.touch(sid)
                         return sid
 
-        # Otherwise find an idle slot
-        idle = self._idle_slots()
-        if idle is not None and idle:
-            return idle[0]
+        # Otherwise find an empty slot (no loaded KV, safe to restore into)
+        empty = self._empty_slots()
+        if empty is not None and empty:
+            return empty[0]
 
         # No idle slots — evict to make room.
         # Prefer evicting a slot with a small loaded node (< 10000 tok),
@@ -899,17 +899,22 @@ class LMCacheHandler(BaseHTTPRequestHandler):
         return None
 
     def _idle_slots(self) -> list[int] | None:
-        """Return ids of slots that are idle (not busy and not tracked), or None in single-slot mode.
-
-        A slot is idle only if llama.cpp reports it as not busy AND it has no
-        loaded KV state tracked in slot_state. This prevents agents from
-        overwriting a slot that holds a long conversation just because it's
-        between requests."""
+        """Return ids of slots that are idle (not busy), or None in single-slot mode."""
         slots = self._discover_slots()
         if slots is None:
             return None
+        return [s["id"] for s in slots if not s.get("is_busy", False)]
+
+    def _empty_slots(self) -> list[int] | None:
+        """Return ids of slots that are truly empty (idle + not tracked in slot_state).
+
+        An idle slot may still have loaded KV cache from a previous request.
+        Empty slots are safe to restore into without evicting."""
+        idle = self._idle_slots()
+        if idle is None:
+            return None
         tracked = set(self.slot_state.all_slot_ids()) if self.slot_state else set()
-        return [s["id"] for s in slots if not s.get("is_busy", False) and s["id"] not in tracked]
+        return [sid for sid in idle if sid not in tracked]
 
     @staticmethod
     def _text_fragments_from_event(obj) -> list[str]:
