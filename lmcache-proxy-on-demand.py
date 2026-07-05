@@ -1370,7 +1370,10 @@ class LMCacheHandler(BaseHTTPRequestHandler):
             cache.insert_node(generated_node)
             inserted_nodes.append(generated_node_id)
 
-        cache.prune_global(max_bytes=self.max_cache_bytes, max_nodes=None, dry_run=False)
+        # Budget enforcement is handled proactively by _ensure_storage_room
+        # before each autosave. Running prune here would delete the nodes we
+        # just created (hits=0, last_used=null → LRU candidates), causing
+        # lookup on the next request to fall back to an old ancestor.
         log.info(
             "prefix-cache autosaved %d node(s): prompt=%s generated=%s (%d→%d saved tokens, %.1f MiB, anchors=%d)",
             len(inserted_nodes),
