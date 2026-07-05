@@ -899,11 +899,17 @@ class LMCacheHandler(BaseHTTPRequestHandler):
         return None
 
     def _idle_slots(self) -> list[int] | None:
-        """Return ids of slots that are idle (not busy), or None in single-slot mode."""
+        """Return ids of slots that are idle (not busy and not tracked), or None in single-slot mode.
+
+        A slot is idle only if llama.cpp reports it as not busy AND it has no
+        loaded KV state tracked in slot_state. This prevents agents from
+        overwriting a slot that holds a long conversation just because it's
+        between requests."""
         slots = self._discover_slots()
         if slots is None:
             return None
-        return [s["id"] for s in slots if not s.get("is_busy", False)]
+        tracked = set(self.slot_state.all_slot_ids()) if self.slot_state else set()
+        return [s["id"] for s in slots if not s.get("is_busy", False) and s["id"] not in tracked]
 
     @staticmethod
     def _text_fragments_from_event(obj) -> list[str]:
