@@ -16,8 +16,16 @@ _spec.loader.exec_module(_lmcp)
 SlotState = _lmcp.SlotState
 
 
-def make_handler(state=None, discover_slots=None, mock_evict=False):
-    """Create a minimal handler instance with needed attributes."""
+def make_handler(state=None, discover_slots=None, mock_evict=False, nodes=None):
+    """Create a minimal handler instance with needed attributes.
+
+    Args:
+        state: SlotState instance or None
+        discover_slots: list of slot dicts for _discover_slots mock
+        mock_evict: if True, mock _evict_slot to return True
+        nodes: dict mapping node_id -> {"id", "parent_id", "token_count", ...}
+            used to build a fake prefix_cache_obj.get_node()
+    """
     class FakeHandler:
         pass
     h = FakeHandler()
@@ -31,6 +39,13 @@ def make_handler(state=None, discover_slots=None, mock_evict=False):
         h._discover_slots = MagicMock(return_value=None)
     if mock_evict:
         h._evict_slot = MagicMock(return_value=True)
+    # Build fake prefix_cache_obj with get_node
+    class FakeCache:
+        def __init__(self, nodes):
+            self._nodes = nodes or {}
+        def get_node(self, node_id):
+            return self._nodes.get(node_id)
+    h.prefix_cache_obj = FakeCache(nodes)
     # Bind the actual methods
     h._pick_slot_for_restore = _lmcp.LMCacheHandler._pick_slot_for_restore.__get__(h, FakeHandler)
     h._idle_slots = _lmcp.LMCacheHandler._idle_slots.__get__(h, FakeHandler)
@@ -45,8 +60,11 @@ class TestPickSlotForRestore(unittest.TestCase):
         """Slot with node >= 5000 tok: request must exhaust slot's prefix (req >= slot_tok)."""
         state = SlotState()
         state.record(0, "node-A", 4000)
-        h = make_handler(state=state, discover_slots=[{"id": 0, "is_busy": False}])
-        node = {"id": "node-A", "token_count": 6000}
+        nodes = {
+            "node-A": {"id": "node-A", "parent_id": None, "token_count": 4000},
+        }
+        h = make_handler(state=state, discover_slots=[{"id": 0, "is_busy": False}], nodes=nodes)
+        node = {"id": "node-A", "parent_id": None, "token_count": 6000}
 
         # Request (6000) covers slot's prefix (4000) → reuse
         result = h._pick_slot_for_restore(node, 6000)
@@ -57,8 +75,11 @@ class TestPickSlotForRestore(unittest.TestCase):
         eviction kicks in and returns a slot."""
         state = SlotState()
         state.record(0, "node-A", 6000)  # slot has more tokens than request
-        h = make_handler(state=state, discover_slots=[{"id": 0, "is_busy": True}], mock_evict=True)
-        node = {"id": "node-A", "token_count": 6000}
+        nodes = {
+            "node-A": {"id": "node-A", "parent_id": None, "token_count": 6000},
+        }
+        h = make_handler(state=state, discover_slots=[{"id": 0, "is_busy": True}], mock_evict=True, nodes=nodes)
+        node = {"id": "node-A", "parent_id": None, "token_count": 6000}
 
         # Request (4000) doesn't cover slot prefix (6000) → not reused, falls to eviction
         result = h._pick_slot_for_restore(node, 4000)
@@ -69,8 +90,11 @@ class TestPickSlotForRestore(unittest.TestCase):
         """Slot with node < 5000 tok: request must cover 80%."""
         state = SlotState()
         state.record(0, "node-B", 3000)
-        h = make_handler(state=state, discover_slots=[{"id": 0, "is_busy": False}])
-        node = {"id": "node-B", "token_count": 3000}
+        nodes = {
+            "node-B": {"id": "node-B", "parent_id": None, "token_count": 3000},
+        }
+        h = make_handler(state=state, discover_slots=[{"id": 0, "is_busy": False}], nodes=nodes)
+        node = {"id": "node-B", "parent_id": None, "token_count": 3000}
 
         result = h._pick_slot_for_restore(node, 2500)  # > 80% of 3000
         self.assertEqual(result, 0)
@@ -80,8 +104,11 @@ class TestPickSlotForRestore(unittest.TestCase):
         but eviction kicks in and returns a slot."""
         state = SlotState()
         state.record(0, "node-B", 3000)
-        h = make_handler(state=state, discover_slots=[{"id": 0, "is_busy": True}], mock_evict=True)
-        node = {"id": "node-B", "token_count": 3000}
+        nodes = {
+            "node-B": {"id": "node-B", "parent_id": None, "token_count": 3000},
+        }
+        h = make_handler(state=state, discover_slots=[{"id": 0, "is_busy": True}], mock_evict=True, nodes=nodes)
+        node = {"id": "node-B", "parent_id": None, "token_count": 3000}
 
         result = h._pick_slot_for_restore(node, 2000)  # < 80% of 3000
         self.assertEqual(result, 0)  # eviction returns slot 0
@@ -138,6 +165,21 @@ class TestPickSlotForRestore(unittest.TestCase):
 
         result = h._pick_slot_for_restore(None, 4000)
         self.assertIsNone(result)
+
+    def test_ancestor_match_reuses_slot(self):
+        """When matched node is a descendant of what a slot holds, reuse that slot."""
+        state = SlotState()
+        state.record(0, "node-A", 99308)  # slot holds ancestor
+        nodes = {
+            "node-A": {"id": "node-A", "parent_id": None, "token_count": 99308},
+            "node-B": {"id": "node-B", "parent_id": "node-A", "token_count": 99747},
+        }
+        h = make_handler(state=state, discover_slots=[{"id": 0, "is_busy": False}], nodes=nodes)
+        node = {"id": "node-B", "parent_id": "node-A", "token_count": 99747}
+
+        # node-B is descendant of node-A → slot 0 holds ancestor → reuse
+        result = h._pick_slot_for_restore(node, 100000)
+        self.assertEqual(result, 0)
 
     def test_idle_slot_used_before_eviction(self):
         """Idle slots are preferred over eviction."""

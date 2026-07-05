@@ -692,35 +692,47 @@ class LMCacheHandler(BaseHTTPRequestHandler):
             return self.slot_id
 
         # If we have a node, check if any tracked slot holds a prefix of it.
-        # Walk the matched node's ancestor chain — if a slot holds an ancestor
-        # (or the node itself), that slot still has a valid KV prefix.
+        # Walk the matched node's ancestor chain — find the deepest (most tokens)
+        # ancestor that a slot holds. That's the longest shared prefix.
         # Only reuse if the request exhausts the slot's loaded prefix:
         #   - node >= 5000 tok → req tokens >= slot tokens
         #   - node < 5000 tok → request covers 80% of it
         if node is not None and node.get("id"):
             node_tok = int(node.get("token_count", 0))
-            # Build set of ancestor node ids (including the node itself)
-            ancestors = {node["id"]}
-            cur_id = node.get("parent_id")
+            # Build ordered list of ancestor node ids (deepest first, including the node itself)
+            ancestors = []
+            cur_id = node["id"]
             while cur_id:
-                ancestors.add(cur_id)
+                ancestors.append(cur_id)
                 cur_node = self.prefix_cache_obj.get_node(cur_id) if self.prefix_cache_obj else None
                 cur_id = cur_node.get("parent_id") if cur_node else None
 
-            if node_tok >= self.min_match_tokens:
-                for sid in self.slot_state.all_slot_ids():
-                    slot_node = self.slot_state.node_for(sid)
-                    if slot_node in ancestors:
-                        slot_tok = self.slot_state.tokens_for(sid)
-                        if slot_tok is not None and req_tokens >= slot_tok:
-                            self.slot_state.touch(sid)
-                            return sid
-            elif req_tokens >= int(node_tok * self.min_match_ratio):
-                for sid in self.slot_state.all_slot_ids():
-                    slot_node = self.slot_state.node_for(sid)
-                    if slot_node in ancestors:
-                        self.slot_state.touch(sid)
-                        return sid
+            # For each slot, find the deepest ancestor it holds
+            best_slot = None
+            best_shared_tok = 0
+            for sid in self.slot_state.all_slot_ids():
+                slot_node = self.slot_state.node_for(sid)
+                if slot_node is None:
+                    continue
+                # Find deepest common ancestor
+                for anc_id in ancestors:
+                    if anc_id == slot_node:
+                        anc_node = self.prefix_cache_obj.get_node(anc_id) if self.prefix_cache_obj else None
+                        anc_tok = int(anc_node.get("token_count", 0)) if anc_node else 0
+                        if anc_tok > best_shared_tok:
+                            best_shared_tok = anc_tok
+                            best_slot = sid
+                        break  # found deepest match for this slot, move on
+
+            if best_slot is not None:
+                if node_tok >= self.min_match_tokens:
+                    slot_tok = self.slot_state.tokens_for(best_slot)
+                    if slot_tok is not None and req_tokens >= slot_tok:
+                        self.slot_state.touch(best_slot)
+                        return best_slot
+                elif req_tokens >= int(node_tok * self.min_match_ratio):
+                    self.slot_state.touch(best_slot)
+                    return best_slot
 
         # Otherwise find an empty slot (no loaded KV, safe to restore into)
         empty = self._empty_slots()
