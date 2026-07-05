@@ -170,6 +170,72 @@ def _get_server_model_info(server: str, port: int) -> dict | None:
         return None
 
 
+class SlotState:
+    """Per-slot tracking for multi-slot routing.
+
+    Records which prefix node is loaded in each slot, the token count,
+    and the last-used timestamp (for LRU eviction).
+    """
+
+    def __init__(self):
+        self._slot_node_id: dict[int, str] = {}   # slot_id → node_id of loaded KV
+        self._slot_tokens: dict[int, int] = {}     # slot_id → token count in loaded KV
+        self._slot_time: dict[int, float] = {}     # slot_id → last-used monotonic time
+        self._lock = Lock()
+
+    def record(self, slot_id: int, node_id: str, token_count: int) -> None:
+        """Record that a slot has the given node loaded."""
+        with self._lock:
+            self._slot_node_id[slot_id] = node_id
+            self._slot_tokens[slot_id] = token_count
+            self._slot_time[slot_id] = time.monotonic()
+
+    def touch(self, slot_id: int) -> None:
+        """Update last-used timestamp for a slot."""
+        with self._lock:
+            self._slot_time[slot_id] = time.monotonic()
+
+    def forget(self, slot_id: int) -> None:
+        """Remove tracking for a slot (e.g. after eviction/erase)."""
+        with self._lock:
+            self._slot_node_id.pop(slot_id, None)
+            self._slot_tokens.pop(slot_id, None)
+            self._slot_time.pop(slot_id, None)
+
+    def has_slot(self, slot_id: int) -> bool:
+        """Whether we are tracking this slot."""
+        with self._lock:
+            return slot_id in self._slot_node_id
+
+    def node_for(self, slot_id: int) -> str | None:
+        """Return the node_id loaded in a slot, or None."""
+        with self._lock:
+            return self._slot_node_id.get(slot_id)
+
+    def tokens_for(self, slot_id: int) -> int | None:
+        """Return the token count for a slot, or None."""
+        with self._lock:
+            return self._slot_tokens.get(slot_id)
+
+    def lru_slot(self) -> int | None:
+        """Return the least-recently-used tracked slot id, or None."""
+        with self._lock:
+            if not self._slot_time:
+                return None
+            return min(self._slot_time, key=self._slot_time.get)
+
+    def all_slot_ids(self) -> list[int]:
+        """Return all tracked slot ids."""
+        with self._lock:
+            return list(self._slot_node_id.keys())
+
+    def idle_slots(self, available: list[int]) -> list[int]:
+        """Return slots that are available but not currently tracked as loaded."""
+        with self._lock:
+            tracked = set(self._slot_node_id.keys())
+            return [s for s in available if s not in tracked]
+
+
 class LMCacheHandler(BaseHTTPRequestHandler):
     """HTTP proxy handler that restores and saves prefix-cache KV on demand."""
 
@@ -192,6 +258,10 @@ class LMCacheHandler(BaseHTTPRequestHandler):
     strict_prefix_restore = True
     generated_prefix_enabled = True
     anchor_configs: list[AnchorConfig] = []
+
+    # Multi-slot routing state.
+    slot_state: SlotState | None = None
+    n_parallel: int | None = None  # discovered from /slots endpoint, or None = single-slot mode"}}]}}]}}}}}}}}}}}}}}} catch (e) { log.warning(
 
     def _forward(self, method: str, path: str, body_bytes: bytes) -> ForwardResult | None:
         """Forward request to llama.cpp, streaming response chunks to the client."""
@@ -619,6 +689,32 @@ class LMCacheHandler(BaseHTTPRequestHandler):
             return {}
         return props if isinstance(props, dict) else {}
 
+    def _discover_slots(self) -> list[dict] | None:
+        """Query llama.cpp /slots endpoint to discover available slots.
+
+        Returns a list of slot dicts, or None on failure. In single-slot mode
+        (n_parallel is None), returns None so the proxy falls back to the
+        hardcoded slot_id.
+        """
+        if self.n_parallel is None:
+            return None
+        try:
+            url = f"http://{self.llama_server}:{self.llama_port}/slots"
+            with urllib.request.urlopen(url, timeout=10) as resp:
+                slots = json.loads(resp.read().decode())
+                if isinstance(slots, list):
+                    return slots
+        except Exception as e:
+            log.debug("/slots discovery failed: %s", e)
+        return None
+
+    def _idle_slots(self) -> list[int] | None:
+        """Return ids of slots that are idle (not busy), or None in single-slot mode."""
+        slots = self._discover_slots()
+        if slots is None:
+            return None
+        return [s["id"] for s in slots if not s.get("is_busy", False)]
+
     @staticmethod
     def _text_fragments_from_event(obj) -> list[str]:
         fragments: list[str] = []
@@ -1022,6 +1118,9 @@ def main():
     parser.add_argument("--cache-dir", default=str(prefix_cache.DEFAULT_CACHE_DIR), help="KV cache directory")
     parser.add_argument("--top-k", type=int, default=3, help="Legacy cache top-k fallback")
     parser.add_argument("--slot", type=int, default=0, help="llama.cpp slot id to restore/save (default: 0)")
+    parser.add_argument("--parallel", type=int, default=None,
+        help="Number of llama.cpp slots (--parallel). When set, enables multi-slot routing; "
+             "without it the proxy uses a single hardcoded slot_id")
     parser.add_argument("--min-save-tokens", type=int, default=256, help="Minimum tokens before autosaving a prefix node")
     parser.add_argument("--prefix-cache-max-bytes", type=parse_bytes, default=8 * GIB, help="Max prefix cache bytes before pruning (default: 8GiB)")
     parser.add_argument("--prefix-cache-min-free-bytes", type=parse_bytes, default=512 * MIB, help="Minimum filesystem free bytes before autosave (default: 512MiB)")
@@ -1062,6 +1161,16 @@ def main():
     LMCacheHandler.min_free_bytes = args.prefix_cache_min_free_bytes
     LMCacheHandler.strict_prefix_restore = not args.allow_exact_prefix_restore
     LMCacheHandler.anchor_configs = anchor_configs
+
+    # Multi-slot routing: enabled when --parallel is set.
+    if args.parallel is not None and args.parallel > 1:
+        LMCacheHandler.n_parallel = args.parallel
+        LMCacheHandler.slot_state = SlotState()
+        log.info("multi-slot routing enabled with %d slots", args.parallel)
+    else:
+        LMCacheHandler.n_parallel = None
+        LMCacheHandler.slot_state = None
+        log.info("single-slot mode (slot_id=%d)", args.slot)
 
     LMCacheHandler.server_model_info = _get_server_model_info(args.server, args.llama_port)
     if LMCacheHandler.server_model_info:
