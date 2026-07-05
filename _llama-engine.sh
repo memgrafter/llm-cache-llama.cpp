@@ -61,6 +61,7 @@ fi
 
 # Context/memory knobs. Set by the proxy stack via env vars.
 NPRED="${NPRED:-8192}"
+THREADS="${THREADS:-8}"
 
 # Server knobs. Set by the proxy stack via env vars.
 
@@ -138,6 +139,7 @@ if [[ "$SERVE" == "1" ]]; then
     --port "$PORT"
     --alias "$ALIAS"
     --parallel "$PARALLEL"
+    ${KV_UNIFIED:+--kv-unified}
     --no-warmup
     --reasoning "${REASONING:-on}"
     --metrics
@@ -250,4 +252,13 @@ echo "SPEC_NGRAM_MOD_N_MATCH=$SPEC_NGRAM_MOD_N_MATCH SPEC_NGRAM_MOD_N_MIN=$SPEC_
 echo "TURBOQUANT=$TURBOQUANT TURBOQUANT_FLAGS=${TURBOQUANT_FLAGS:-<auto/implicit>} EXTRA_FLAGS=${EXTRA_FLAGS:-<none>}"
 echo
 
-exec "$BIN" "${args[@]}"
+# CPU pinning. Set by the proxy stack via env vars.
+TASKSET_CPUS="${TASKSET_CPUS:-}"
+
+if [[ "$SERVE" == "1" && -n "$TASKSET_CPUS" ]]; then
+  exec taskset -c "$TASKSET_CPUS" "$BIN" "${args[@]}"
+elif [[ "$SERVE" == "1" ]]; then
+  exec "$BIN" "${args[@]}"
+else
+  exec "$BIN" "${args[@]}"
+fi

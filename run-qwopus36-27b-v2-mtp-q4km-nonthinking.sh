@@ -6,6 +6,7 @@ export MODELS_DIR="${MODELS_DIR:-$SCRIPT_DIR/models}"
 
 export PUBLIC_HOST="0.0.0.0"
 export DEVICE="${DEVICE:-CUDA0}"
+export TASKSET_CPUS="0-7"  # first half of P-cores (HT) for CUDA0
 export MODEL="${MODEL:-$MODELS_DIR/Qwopus3.6-27B-v2-MTP-Q4_K_M.gguf}"
 export ALIAS="${ALIAS:-local-model,Qwopus3.6-27B-v2-MTP-Q4_K_M}"
 export CACHE_DIR="${CACHE_DIR:-$HOME/.cache/llama.cpp-launch-scripts/qwopus36-27b-v2-mtp-q4km-nonthinking}"
