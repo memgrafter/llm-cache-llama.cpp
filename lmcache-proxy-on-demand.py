@@ -590,39 +590,100 @@ class LMCacheHandler(BaseHTTPRequestHandler):
         )
         return modified, modified_ctx, json.dumps(modified, separators=(",", ":")).encode("utf-8")
 
-    def _lookup_and_restore_prefix(self, ctx: RequestCacheContext) -> None:
+    def _pick_slot_for_restore(self, node: dict | None) -> int:
+        """Pick the best slot to restore a node into.
+
+        In single-slot mode, returns the hardcoded slot_id.
+        In multi-slot mode, prefers a slot that already has this node loaded,
+        then any idle slot, falling back to the default slot_id.
+        """
+        if self.slot_state is None:
+            return self.slot_id
+
+        # If we have a node, check if any tracked slot already has it
+        if node is not None and node.get("id"):
+            for sid in self.slot_state.all_slot_ids():
+                if self.slot_state.node_for(sid) == node["id"]:
+                    self.slot_state.touch(sid)
+                    return sid
+
+        # Otherwise find an idle slot
+        idle = self._idle_slots()
+        if idle is not None and idle:
+            return idle[0]
+
+        # Fallback to default slot
+        return self.slot_id
+
+    def _lookup_and_restore_prefix(self, ctx: RequestCacheContext) -> int | None:
+        """Restore the best matching prefix node into a slot.
+
+        Returns the target slot_id (for id_slot injection), or None in single-slot mode.
+        """
         cache = self.prefix_cache_obj
         if cache is None:
-            return
+            return None
         cache.init()
+
+        # Single-slot mode: use hardcoded slot_id
+        if self.slot_state is None:
+            target_slot = self.slot_id
+        else:
+            target_slot = None  # will be set by _pick_slot_for_restore
+
         node = cache.lookup(ctx.prompt_tokens, touch=True, strictly_less=self.strict_prefix_restore)
         via = "full-prefix"
         if node and node.get("boundary") == "anchor":
             via = "materialized-anchor"
         if node:
-            result = _restore_slot(self.slot_id, node["bin_file"], self.llama_server, self.llama_port)
+            slot = self._pick_slot_for_restore(node) if self.slot_state is not None else self.slot_id
+            result = _restore_slot(slot, node["bin_file"], self.llama_server, self.llama_port)
             if result:
                 ctx.restored_node_id = node["id"]
                 ctx.restored_via = via
-                log.info("prefix-cache restored node %s (%s tokens) via %s", node["id"], node["token_count"], via)
-            return
+                if self.slot_state is not None:
+                    self.slot_state.record(slot, node["id"], int(node.get("token_count", 0)))
+                log.info("prefix-cache restored node %s (%s tokens) via %s into slot %d",
+                         node["id"], node["token_count"], via, slot)
+            return slot if self.slot_state is not None else None
 
         for anchor in sorted(ctx.anchors, key=lambda a: len(a.tokens), reverse=True):
-            node = cache.lookup_materialized_anchor(label=anchor.config.label, tokens=anchor.tokens, touch=True)
-            if node:
-                result = _restore_slot(self.slot_id, node["bin_file"], self.llama_server, self.llama_port)
+            anchor_node = cache.lookup_materialized_anchor(label=anchor.config.label,
+                                                           tokens=anchor.tokens, touch=True)
+            if anchor_node:
+                slot = self._pick_slot_for_restore(anchor_node) if self.slot_state is not None else self.slot_id
+                result = _restore_slot(slot, anchor_node["bin_file"],
+                                       self.llama_server, self.llama_port)
                 if result:
-                    ctx.restored_node_id = node["id"]
+                    ctx.restored_node_id = anchor_node["id"]
                     ctx.restored_via = f"anchor:{anchor.config.label}"
-                    log.info("prefix-cache restored node %s (%s tokens) via %s", node["id"], node["token_count"], ctx.restored_via)
-                return
+                    if self.slot_state is not None:
+                        self.slot_state.record(slot, anchor_node["id"],
+                                               int(anchor_node.get("token_count", 0)))
+                    log.info("prefix-cache restored node %s (%s tokens) via %s into slot %d",
+                             anchor_node["id"], anchor_node["token_count"],
+                             ctx.restored_via, slot)
+                return slot if self.slot_state is not None else None
 
             node = self._materialize_anchor_once(anchor)
             if node:
+                slot = self._pick_slot_for_restore(node) if self.slot_state is not None else self.slot_id
                 ctx.restored_node_id = node["id"]
                 ctx.restored_via = f"anchor-materialized:{anchor.config.label}"
-                log.info("prefix-cache using newly materialized anchor node %s (%s tokens)", node["id"], node["token_count"])
-                return
+                if self.slot_state is not None:
+                    self.slot_state.record(slot, node["id"], int(node.get("token_count", 0)))
+                log.info("prefix-cache using newly materialized anchor node %s (%s tokens) into slot %d",
+                         node["id"], node["token_count"], slot)
+                return slot if self.slot_state is not None else None
+
+        # No match found — in multi-slot mode, try to find an idle slot anyway
+        if self.slot_state is not None:
+            idle = self._idle_slots()
+            if idle is not None and idle:
+                log.debug("prefix-cache no node match; using idle slot %d", idle[0])
+                return idle[0]
+
+        return None
 
     def _restore_legacy_cache(self, body: dict) -> None:
         if self.prefix_cache_obj is not None or self.cache_dir_obj is None:
@@ -1030,6 +1091,7 @@ class LMCacheHandler(BaseHTTPRequestHandler):
         if self.headers.get("X-LMCache-Bypass") == "1":
             return self._forward(method, path, body_bytes)
 
+        target_slot: int | None = None
         ctx = self._request_cache_context(path, body) if method == "POST" else None
         if ctx is not None:
             modified_body, modified_ctx, modified_body_bytes = self._maybe_apply_exact_prefix_newline_workaround(path, body, ctx)
@@ -1037,9 +1099,15 @@ class LMCacheHandler(BaseHTTPRequestHandler):
                 body = modified_body
                 body_bytes = modified_body_bytes
                 ctx = modified_ctx
-            self._lookup_and_restore_prefix(ctx)
+            target_slot = self._lookup_and_restore_prefix(ctx)
         else:
             self._restore_legacy_cache(body)
+
+        # Inject id_slot when multi-slot routing is enabled and we have a target slot
+        if target_slot is not None:
+            body["id_slot"] = target_slot
+            body_bytes = json.dumps(body, separators=(",", ":")).encode("utf-8")
+            log.debug("routed to slot %d", target_slot)
 
         result = self._forward(method, path, body_bytes)
 
