@@ -714,29 +714,23 @@ class LMCacheHandler(BaseHTTPRequestHandler):
         if idle is not None and idle:
             return idle[0]
 
-        # No idle slots — check if the match is long enough to justify overwriting
-        # a tracked slot. Rules:
-        #   1) request > min_match_tokens → overwrite (large request is valuable
-        #      enough to displace whatever is in the slot)
-        #   2) cached node < min_match_tokens → request must cover
-        #      min_match_ratio of it (small cache, not worth protecting)
+        # No idle slots — evict to make room.
+        # Prefer evicting a slot with a small loaded node (< 10000 tok),
+        # otherwise evict the LRU slot.
         if node is not None:
-            node_tok = int(node.get("token_count", 0))
-            if req_tokens >= self.min_match_tokens:
-                pass  # large request — safe to overwrite any slot
-            elif node_tok < self.min_match_tokens and req_tokens < int(node_tok * self.min_match_ratio):
-                return None  # small node + request doesn't cover enough
-            # else: small node but request covers it — safe to overwrite
+            target = None
+            for sid in self.slot_state.all_slot_ids():
+                slot_tok = self.slot_state.tokens_for(sid)
+                if slot_tok is not None and slot_tok < 10000:
+                    target = sid
+                    break
+            if target is None:
+                target = self.slot_state.lru_slot()
+            if target is not None:
+                self._evict_slot(target)
+                self.slot_state.forget(target)
+                return target
 
-            # Pick the LRU slot to overwrite
-            lru = self.slot_state.lru_slot()
-            if lru is not None:
-                # Save the evicted slot's state before overwriting
-                self._evict_slot(lru)
-                self.slot_state.forget(lru)
-                return lru
-
-        # Match too short to justify overwriting — skip restore entirely.
         return None
 
     def _lookup_and_restore_prefix(self, ctx: RequestCacheContext) -> int | None:
