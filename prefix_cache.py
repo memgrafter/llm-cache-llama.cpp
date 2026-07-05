@@ -482,7 +482,7 @@ class PrefixCache:
                     node.get("ctx_size"),
                     node.get("hits", 0),
                     node["created_at"],
-                    node.get("last_used"),
+                    node.get("last_used") or utc_now(),
                     1 if node.get("pinned") else 0,
                     json.dumps(node.get("meta", {}), sort_keys=True),
                 ),
