@@ -688,12 +688,22 @@ class LMCacheHandler(BaseHTTPRequestHandler):
         if self.slot_state is None:
             return self.slot_id
 
-        # If we have a node, check if any tracked slot already has it
+        # If we have a node, check if any tracked slot already has it.
+        # Only reuse the slot if the prefix match is substantial:
+        #   - node >= 5000 tok → match is valuable, use the slot
+        #   - node < 5000 tok → request must cover 80% of it
         if node is not None and node.get("id"):
-            for sid in self.slot_state.all_slot_ids():
-                if self.slot_state.node_for(sid) == node["id"]:
-                    self.slot_state.touch(sid)
-                    return sid
+            node_tok = int(node.get("token_count", 0))
+            if node_tok >= self.min_match_tokens:
+                for sid in self.slot_state.all_slot_ids():
+                    if self.slot_state.node_for(sid) == node["id"]:
+                        self.slot_state.touch(sid)
+                        return sid
+            elif req_tokens >= int(node_tok * self.min_match_ratio):
+                for sid in self.slot_state.all_slot_ids():
+                    if self.slot_state.node_for(sid) == node["id"]:
+                        self.slot_state.touch(sid)
+                        return sid
 
         # Otherwise find an idle slot
         idle = self._idle_slots()
@@ -701,19 +711,26 @@ class LMCacheHandler(BaseHTTPRequestHandler):
             return idle[0]
 
         # No idle slots — check if the match is long enough to justify overwriting
-        # a tracked slot. Threshold: at least min_match_tokens AND at least
-        # min_match_ratio of the request's token count (whichever is lower).
+        # a tracked slot. Rules:
+        #   1) request > min_match_tokens → overwrite (large request is valuable
+        #      enough to displace whatever is in the slot)
+        #   2) cached node < min_match_tokens → request must cover
+        #      min_match_ratio of it (small cache, not worth protecting)
         if node is not None:
             node_tok = int(node.get("token_count", 0))
-            threshold = max(self.min_match_tokens, int(req_tokens * self.min_match_ratio))
-            if node_tok >= threshold:
-                # Match is long enough — pick the LRU slot to overwrite
-                lru = self.slot_state.lru_slot()
-                if lru is not None:
-                    # Save the evicted slot's state before overwriting
-                    self._evict_slot(lru)
-                    self.slot_state.forget(lru)
-                    return lru
+            if req_tokens >= self.min_match_tokens:
+                pass  # large request — safe to overwrite any slot
+            elif node_tok < self.min_match_tokens and req_tokens < int(node_tok * self.min_match_ratio):
+                return None  # small node + request doesn't cover enough
+            # else: small node but request covers it — safe to overwrite
+
+            # Pick the LRU slot to overwrite
+            lru = self.slot_state.lru_slot()
+            if lru is not None:
+                # Save the evicted slot's state before overwriting
+                self._evict_slot(lru)
+                self.slot_state.forget(lru)
+                return lru
 
         # Match too short to justify overwriting — skip restore entirely.
         return None
