@@ -1177,7 +1177,7 @@ class LMCacheHandler(BaseHTTPRequestHandler):
             return None
         return slot_tokens[:lcp]
 
-    def _auto_save_prefix_cache(self, ctx: RequestCacheContext, request_body: dict, result: ForwardResult | None) -> None:
+    def _auto_save_prefix_cache(self, ctx: RequestCacheContext, request_body: dict, result: ForwardResult | None, slot_id: int | None = None) -> None:
         if not self.auto_save_enabled or self.prefix_cache_obj is None or result is None:
             return
         if result.status < 200 or result.status >= 300:
@@ -1220,7 +1220,7 @@ class LMCacheHandler(BaseHTTPRequestHandler):
 
         tmp_file = f"prefix_tmp_{time.time_ns()}.bin"
         tmp_path = cache.absolute_bin_path(tmp_file)
-        save = _save_slot(self.slot_id, tmp_file, self.llama_server, self.llama_port)
+        save = _save_slot(slot_id if slot_id is not None else self.slot_id, tmp_file, self.llama_server, self.llama_port)
         if not isinstance(save, dict):
             return
         n_saved = int(save.get("n_saved", -1))
@@ -1428,7 +1428,7 @@ class LMCacheHandler(BaseHTTPRequestHandler):
         if ctx is not None:
             try:
                 with self._cache_lock:
-                    self._auto_save_prefix_cache(ctx, body, result)
+                    self._auto_save_prefix_cache(ctx, body, result, target_slot)
             except Exception as e:
                 log.warning("prefix-cache autosave failed gracefully: %s", e)
         return result
