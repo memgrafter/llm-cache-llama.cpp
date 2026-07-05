@@ -48,11 +48,12 @@ class TestKVCache(unittest.TestCase):
 class TestSlotManagerUnit(unittest.TestCase):
     """Unit tests for SlotManager slot-hash tracking and LRU."""
 
-    def _make_manager(self, cache_dir=None):
+    def _make_manager(self, cache_dir=None, min_match_tokens=0):
         if cache_dir is None:
             cache_dir = tempfile.mkdtemp()
         cache = KVCache(cache_dir)
-        return SlotManager("localhost", 8081, cache), cache
+        return SlotManager("localhost", 8081, cache,
+                           min_match_tokens=min_match_tokens), cache
 
     # -- get_best_slot --
 
@@ -61,27 +62,31 @@ class TestSlotManagerUnit(unittest.TestCase):
         self.assertIsNone(sm.get_best_slot("any prompt"))
 
     def test_get_best_slot_exact_match(self):
-        sm, cache = self._make_manager()
+        sm, cache = self._make_manager(min_match_tokens=0)
         prompt = "the quick brown fox"
         h = cache._hash_prefix(prompt)
         sm._slot_hash[0] = h
+        sm._slot_tokens[0] = 100
         sm._slot_time[0] = time.monotonic()
 
         self.assertEqual(sm.get_best_slot(prompt), 0)
 
     def test_get_best_slot_no_match(self):
-        sm, cache = self._make_manager()
+        sm, cache = self._make_manager(min_match_tokens=0)
         sm._slot_hash[0] = cache._hash_prefix("different prompt")
+        sm._slot_tokens[0] = 100
         sm._slot_time[0] = time.monotonic()
 
         self.assertIsNone(sm.get_best_slot("unrelated prompt"))
 
     def test_get_best_slot_returns_first_matching(self):
-        sm, cache = self._make_manager()
+        sm, cache = self._make_manager(min_match_tokens=0)
         prompt = "shared prefix"
         h = cache._hash_prefix(prompt)
         sm._slot_hash[0] = h
+        sm._slot_tokens[0] = 100
         sm._slot_hash[2] = h
+        sm._slot_tokens[2] = 100
         sm._slot_time[0] = time.monotonic()
         sm._slot_time[2] = time.monotonic()
 
@@ -90,18 +95,56 @@ class TestSlotManagerUnit(unittest.TestCase):
         self.assertIn(result, [0, 2])
 
     def test_get_best_slot_ignores_nonmatching_slots(self):
-        sm, cache = self._make_manager()
+        sm, cache = self._make_manager(min_match_tokens=0)
         prompt = "target"
         h_target = cache._hash_prefix(prompt)
         h_other = cache._hash_prefix("other")
         sm._slot_hash[0] = h_other
+        sm._slot_tokens[0] = 100
         sm._slot_hash[1] = h_target
+        sm._slot_tokens[1] = 100
         sm._slot_hash[2] = h_other
+        sm._slot_tokens[2] = 100
         sm._slot_time[0] = time.monotonic()
         sm._slot_time[1] = time.monotonic()
         sm._slot_time[2] = time.monotonic()
 
         self.assertEqual(sm.get_best_slot(prompt), 1)
+
+    def test_get_best_slot_rejects_below_min_tokens(self):
+        """Slot has matching hash but too few tokens — rejected."""
+        sm, cache = self._make_manager(min_match_tokens=5000)
+        # long prompt (~20k chars = ~5k tok) but slot only has 100 tok
+        prompt = "x" * 20_000
+        h = cache._hash_prefix(prompt)
+        sm._slot_hash[0] = h
+        sm._slot_tokens[0] = 100  # below threshold
+        sm._slot_time[0] = time.monotonic()
+
+        self.assertIsNone(sm.get_best_slot(prompt))
+
+    def test_get_best_slot_accepts_above_min_tokens(self):
+        """Slot has matching hash and enough tokens — accepted."""
+        sm, cache = self._make_manager(min_match_tokens=5000)
+        prompt = "x" * 20_000
+        h = cache._hash_prefix(prompt)
+        sm._slot_hash[0] = h
+        sm._slot_tokens[0] = 6000  # above threshold
+        sm._slot_time[0] = time.monotonic()
+
+        self.assertEqual(sm.get_best_slot(prompt), 0)
+
+    def test_get_best_slot_ratio_threshold(self):
+        """Short request: 80% of request context is the threshold, not min_tokens."""
+        sm, cache = self._make_manager(min_match_tokens=5000)
+        # short prompt (~4k chars = ~1k tok), 80% of 1k = 800
+        prompt = "y" * 4_000
+        h = cache._hash_prefix(prompt)
+        sm._slot_hash[0] = h
+        sm._slot_tokens[0] = 900  # above 80% of request (800), below min_tokens (5000)
+        sm._slot_time[0] = time.monotonic()
+
+        self.assertEqual(sm.get_best_slot(prompt), 0)
 
     # -- lru_slot --
 
@@ -245,6 +288,7 @@ class TestSlotRoutingIntegration(unittest.TestCase):
         prompt = "the quick brown fox jumps"
         h = cache._hash_prefix(prompt)
         sm._slot_hash[2] = h
+        sm._slot_tokens[2] = 1000
         sm._slot_time[2] = time.monotonic()
 
         # Test the routing logic directly (can't construct handler without socket):
@@ -276,6 +320,7 @@ class TestSlotRoutingIntegration(unittest.TestCase):
         prompt = "roundtrip test prompt"
         h = cache._hash_prefix(prompt)
         sm._slot_hash[3] = h
+        sm._slot_tokens[3] = 1000
         sm._slot_time[3] = time.monotonic()
 
         # Verify routing decision
@@ -309,10 +354,46 @@ class TestSlotRoutingIntegration(unittest.TestCase):
         prompts = ["alpha", "beta", "gamma"]
         for i, p in enumerate(prompts):
             sm._slot_hash[i] = cache._hash_prefix(p)
+            sm._slot_tokens[i] = 1000
             sm._slot_time[i] = time.monotonic()
 
         for i, p in enumerate(prompts):
             self.assertEqual(sm.get_best_slot(p), i)
+
+    def test_try_disk_cache_no_match_in_slots(self):
+        """When no slot matches, try_disk_cache checks on-disk trie and restores into idle slot."""
+        with tempfile.TemporaryDirectory() as d:
+            cache = KVCache(d)
+            sm = SlotManager("127.0.0.1", self.server_port, cache)
+            prompt = "disk cache test prompt"
+
+            # No slots loaded
+            self.assertIsNone(sm.get_best_slot(prompt))
+
+            # try_disk_cache: no files on disk either → None
+            result = sm.try_disk_cache(prompt)
+            self.assertIsNone(result)
+
+    def test_try_disk_cache_with_file_on_disk(self):
+        """When a KV file exists on disk and an idle slot is available, restore it."""
+        with tempfile.TemporaryDirectory() as d:
+            cache = KVCache(d)
+            # Create a fake cached file
+            prompt = "disk cache hit"
+            h = cache._hash_prefix(prompt)
+            fake_dir = pathlib.Path(d) / h
+            fake_dir.mkdir(parents=True)
+            fake_file = fake_dir / "0_1234.bin"
+            fake_file.write_bytes(b"fake kv data")
+
+            sm = SlotManager("127.0.0.1", self.server_port, cache)
+            # Slot 0 is idle (mock server returns all idle)
+            result = sm.try_disk_cache(prompt)
+
+            # Should have restored into an idle slot
+            self.assertIsNotNone(result)
+            self.assertIn(result, [0, 1, 2, 3])
+            self.assertEqual(sm._slot_hash[result], h)
 
     def test_lru_after_multiple_updates(self):
         """After updating slot times, LRU returns the oldest."""

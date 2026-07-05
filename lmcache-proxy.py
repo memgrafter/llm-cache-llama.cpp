@@ -102,24 +102,70 @@ def _save_slot(slot_id: int, filename: str, server: str = "localhost", port: int
 class SlotManager:
     """Manages pre-loading KV states into idle slots."""
 
-    def __init__(self, llama_server, llama_port, cache, poll_interval: float = 5.0):
+    def __init__(self, llama_server, llama_port, cache, poll_interval: float = 5.0,
+                 min_match_tokens: int = 5000, min_match_ratio: float = 0.8):
         self.llama_server = llama_server
         self.llama_port = llama_port
         self.cache = cache
         self.poll_interval = poll_interval
+        self.min_match_tokens = min_match_tokens
+        self.min_match_ratio = min_match_ratio
         self._running = False
         self._thread = None
         self._slot_hash: dict[int, str] = {}  # slot_id -> prompt hash of loaded KV
+        self._slot_tokens: dict[int, int] = {}  # slot_id -> estimated token count in loaded KV
         self._slot_time: dict[int, float] = {}  # slot_id -> last used timestamp (for LRU)
         self._lock = Lock()
 
     def get_best_slot(self, prompt: str) -> int | None:
-        """Return the slot whose loaded KV best matches the prompt hash, or None."""
+        """Return the slot whose loaded KV best matches the prompt hash, or None.
+
+        Enforces minimum match threshold: the slot's loaded token count must be at
+        least min_match_tokens AND at least min_match_ratio of the request's estimated
+        token count (whichever is lower). Prevents routing short system-prompt-only
+        requests to slots loaded with long conversations.
+        """
         h = self.cache._hash_prefix(prompt)
+        # estimate tokens from char count (~4 chars per token)
+        req_tokens = max(1, len(prompt) // 4)
+        threshold = min(self.min_match_tokens, int(req_tokens * self.min_match_ratio))
+
         with self._lock:
             for sid, sh in self._slot_hash.items():
                 if sh == h:
-                    return sid
+                    slot_tok = self._slot_tokens.get(sid, 0)
+                    if slot_tok >= threshold:
+                        return sid
+        return None
+
+    def try_disk_cache(self, prompt: str) -> int | None:
+        """If no slot matches, check on-disk trie cache for a matching KV file.
+
+        If found and an idle slot is available, restore the KV into that slot,
+        update tracking state, and return the slot_id. Otherwise return None.
+        """
+        kv_files = self.cache.find_match(prompt)
+        if not kv_files:
+            return None
+
+        # find an idle slot (not tracked in _slot_hash)
+        idle_slots = self._get_idle_slots()
+        if not idle_slots:
+            return None
+
+        slot_id = idle_slots[0]["id"]
+        kv_path = kv_files[0]
+        log.info("disk cache hit for prompt, restoring %s into slot %d", kv_path, slot_id)
+        result = _restore_slot(slot_id, kv_path, self.llama_server, self.llama_port)
+        if result:
+            ph = self.cache._hash_prefix(prompt)
+            est_tokens = max(1, len(prompt) // 4)
+            with self._lock:
+                self._slot_hash[slot_id] = ph
+                self._slot_tokens[slot_id] = est_tokens
+                self._slot_time[slot_id] = time.monotonic()
+            log.info("KV restored from disk cache into slot %d", slot_id)
+            return slot_id
         return None
 
     def lru_slot(self) -> int | None:
@@ -193,8 +239,10 @@ class SlotManager:
                     result = _restore_slot(slot_id, kv_path, self.llama_server, self.llama_port)
                     if result:
                         ph = self.cache._hash_prefix(prompt_text)
+                        est_tokens = max(1, len(prompt_text) // 4)
                         with self._lock:
                             self._slot_hash[slot_id] = ph
+                            self._slot_tokens[slot_id] = est_tokens
                             self._slot_time[slot_id] = time.monotonic()
                         log.info("KV restored into slot %d", slot_id)
                         break
@@ -265,6 +313,9 @@ class LMCacheHandler(BaseHTTPRequestHandler):
             sm = self.slot_manager
             if sm is not None:
                 target = sm.get_best_slot(prompts[0])
+                if target is None:
+                    # No slot match — try on-disk trie cache fallback
+                    target = sm.try_disk_cache(prompts[0])
                 if target is not None:
                     body["id_slot"] = target
                     body_bytes = json.dumps(body).encode("utf-8")
