@@ -1,8 +1,8 @@
 ---
 id: lcl-2ocq
-status: open
+status: resolved
 deps: []
-links: []
+links: [a111cb5]
 created: 2026-07-05T09:49:43Z
 type: feature
 priority: 2
