@@ -253,6 +253,8 @@ class LMCacheHandler(BaseHTTPRequestHandler):
     prefix_cache_enabled = True
     auto_save_enabled = True
     min_save_tokens = 256
+    min_match_tokens = 5000  # minimum tokens a match must cover to overwrite a loaded slot
+    min_match_ratio = 0.8   # minimum fraction of request tokens a match must cover
     max_cache_bytes = 2 * GIB
     min_free_bytes = 512 * MIB
     strict_prefix_restore = True
@@ -590,12 +592,14 @@ class LMCacheHandler(BaseHTTPRequestHandler):
         )
         return modified, modified_ctx, json.dumps(modified, separators=(",", ":")).encode("utf-8")
 
-    def _pick_slot_for_restore(self, node: dict | None) -> int:
+    def _pick_slot_for_restore(self, node: dict | None, req_tokens: int) -> int | None:
         """Pick the best slot to restore a node into.
 
         In single-slot mode, returns the hardcoded slot_id.
         In multi-slot mode, prefers a slot that already has this node loaded,
-        then any idle slot, falling back to the default slot_id.
+        then any idle slot. If no idle slots exist and the match is too short
+        to justify overwriting a loaded slot, returns None (caller should skip
+        restore and let llama.cpp handle fresh).
         """
         if self.slot_state is None:
             return self.slot_id
@@ -612,6 +616,21 @@ class LMCacheHandler(BaseHTTPRequestHandler):
         if idle is not None and idle:
             return idle[0]
 
+        # No idle slots — check if the match is long enough to justify overwriting
+        # a tracked slot. Threshold: at least min_match_tokens AND at least
+        # min_match_ratio of the request's token count (whichever is lower).
+        if node is not None:
+            node_tok = int(node.get("token_count", 0))
+            threshold = min(self.min_match_tokens, int(req_tokens * self.min_match_ratio))
+            if node_tok >= threshold:
+                # Match is long enough — pick the LRU slot to overwrite
+                lru = self.slot_state.lru_slot()
+                if lru is not None:
+                    return lru
+
+        # Match too short to justify overwriting — skip restore entirely.
+        return None
+
         # Fallback to default slot
         return self.slot_id
 
@@ -619,24 +638,26 @@ class LMCacheHandler(BaseHTTPRequestHandler):
         """Restore the best matching prefix node into a slot.
 
         Returns the target slot_id (for id_slot injection), or None in single-slot mode.
+        In multi-slot mode, may also return None if the match is too short to justify
+        overwriting a loaded slot (min_match_tokens / min_match_ratio threshold).
         """
         cache = self.prefix_cache_obj
         if cache is None:
             return None
         cache.init()
 
-        # Single-slot mode: use hardcoded slot_id
-        if self.slot_state is None:
-            target_slot = self.slot_id
-        else:
-            target_slot = None  # will be set by _pick_slot_for_restore
+        req_tokens = len(ctx.prompt_tokens)
 
         node = cache.lookup(ctx.prompt_tokens, touch=True, strictly_less=self.strict_prefix_restore)
         via = "full-prefix"
         if node and node.get("boundary") == "anchor":
             via = "materialized-anchor"
         if node:
-            slot = self._pick_slot_for_restore(node) if self.slot_state is not None else self.slot_id
+            slot = self._pick_slot_for_restore(node, req_tokens)
+            if slot is None:
+                log.debug("prefix-cache match too short to overwrite loaded slot (%d < threshold)",
+                          int(node.get("token_count", 0)))
+                return None
             result = _restore_slot(slot, node["bin_file"], self.llama_server, self.llama_port)
             if result:
                 ctx.restored_node_id = node["id"]
@@ -645,13 +666,16 @@ class LMCacheHandler(BaseHTTPRequestHandler):
                     self.slot_state.record(slot, node["id"], int(node.get("token_count", 0)))
                 log.info("prefix-cache restored node %s (%s tokens) via %s into slot %d",
                          node["id"], node["token_count"], via, slot)
-            return slot if self.slot_state is not None else None
+            return slot
 
         for anchor in sorted(ctx.anchors, key=lambda a: len(a.tokens), reverse=True):
             anchor_node = cache.lookup_materialized_anchor(label=anchor.config.label,
                                                            tokens=anchor.tokens, touch=True)
             if anchor_node:
-                slot = self._pick_slot_for_restore(anchor_node) if self.slot_state is not None else self.slot_id
+                slot = self._pick_slot_for_restore(anchor_node, req_tokens)
+                if slot is None:
+                    log.debug("prefix-cache anchor match too short to overwrite loaded slot")
+                    continue
                 result = _restore_slot(slot, anchor_node["bin_file"],
                                        self.llama_server, self.llama_port)
                 if result:
@@ -663,18 +687,21 @@ class LMCacheHandler(BaseHTTPRequestHandler):
                     log.info("prefix-cache restored node %s (%s tokens) via %s into slot %d",
                              anchor_node["id"], anchor_node["token_count"],
                              ctx.restored_via, slot)
-                return slot if self.slot_state is not None else None
+                return slot
 
             node = self._materialize_anchor_once(anchor)
             if node:
-                slot = self._pick_slot_for_restore(node) if self.slot_state is not None else self.slot_id
+                slot = self._pick_slot_for_restore(node, req_tokens)
+                if slot is None:
+                    log.debug("prefix-cache materialized anchor too short to overwrite loaded slot")
+                    continue
                 ctx.restored_node_id = node["id"]
                 ctx.restored_via = f"anchor-materialized:{anchor.config.label}"
                 if self.slot_state is not None:
                     self.slot_state.record(slot, node["id"], int(node.get("token_count", 0)))
                 log.info("prefix-cache using newly materialized anchor node %s (%s tokens) into slot %d",
                          node["id"], node["token_count"], slot)
-                return slot if self.slot_state is not None else None
+                return slot
 
         # No match found — in multi-slot mode, try to find an idle slot anyway
         if self.slot_state is not None:
@@ -1190,6 +1217,10 @@ def main():
         help="Number of llama.cpp slots (--parallel). When set, enables multi-slot routing; "
              "without it the proxy uses a single hardcoded slot_id")
     parser.add_argument("--min-save-tokens", type=int, default=256, help="Minimum tokens before autosaving a prefix node")
+    parser.add_argument("--min-match-tokens", type=int, default=5000,
+        help="Minimum token match length to overwrite a loaded slot (default: 5000)")
+    parser.add_argument("--min-match-ratio", type=float, default=0.8,
+        help="Minimum fraction of request tokens a match must cover (default: 0.8)")
     parser.add_argument("--prefix-cache-max-bytes", type=parse_bytes, default=8 * GIB, help="Max prefix cache bytes before pruning (default: 8GiB)")
     parser.add_argument("--prefix-cache-min-free-bytes", type=parse_bytes, default=512 * MIB, help="Minimum filesystem free bytes before autosave (default: 512MiB)")
     parser.add_argument("--no-prefix-cache", action="store_true", help="Disable trie-backed prefix cache")
@@ -1225,6 +1256,8 @@ def main():
     LMCacheHandler.auto_save_enabled = not args.no_auto_save
     LMCacheHandler.generated_prefix_enabled = not args.no_generated_prefix_cache
     LMCacheHandler.min_save_tokens = args.min_save_tokens
+    LMCacheHandler.min_match_tokens = args.min_match_tokens
+    LMCacheHandler.min_match_ratio = args.min_match_ratio
     LMCacheHandler.max_cache_bytes = args.prefix_cache_max_bytes
     LMCacheHandler.min_free_bytes = args.prefix_cache_min_free_bytes
     LMCacheHandler.strict_prefix_restore = not args.allow_exact_prefix_restore
