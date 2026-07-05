@@ -10,7 +10,7 @@ export TASKSET_CPUS="0-7"  # first half of P-cores (HT) for CUDA0
 export MODEL="${MODEL:-$MODELS_DIR/Qwopus3.6-27B-v2-MTP-Q4_K_M.gguf}"
 export ALIAS="${ALIAS:-local-model,Qwopus3.6-27B-v2-MTP-Q4_K_M}"
 export CACHE_DIR="${CACHE_DIR:-$HOME/.cache/llama.cpp-launch-scripts/qwopus36-27b-v2-mtp-q4km-nonthinking}"
-export CTX="${CTX:-160000}"
+export CTX="${CTX:-130000}"
 export BATCH="${BATCH:-4096}"
 export UBATCH="${UBATCH:-1024}"
 if [[ "$(uname -s)" == "Linux" ]]; then
