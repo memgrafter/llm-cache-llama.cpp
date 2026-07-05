@@ -734,6 +734,38 @@ class LMCacheHandler(BaseHTTPRequestHandler):
                     self.slot_state.touch(best_slot)
                     return best_slot
 
+            # No ancestor match — check for sibling nodes (same parent, close token count).
+            # This happens when autosave creates a node whose parent_for couldn't find
+            # the restored slot's node (not saved to trie yet), making them siblings.
+            if best_slot is None and self.prefix_cache_obj is not None:
+                matched_parent = node.get("parent_id")
+                for sid in self.slot_state.all_slot_ids():
+                    slot_node_id = self.slot_state.node_for(sid)
+                    if slot_node_id is None:
+                        continue
+                    slot_node = self.prefix_cache_obj.get_node(slot_node_id)
+                    if slot_node is None:
+                        continue
+                    slot_parent = slot_node.get("parent_id")
+                    slot_tok = int(slot_node.get("token_count", 0))
+                    # Same parent + close token count (< 1% difference) = same conversation
+                    if matched_parent and slot_parent == matched_parent and abs(node_tok - slot_tok) < node_tok * 0.01:
+                        if req_tokens >= slot_tok:
+                            self.slot_state.touch(sid)
+                            best_slot = sid
+                            best_shared_tok = slot_tok
+                            break
+
+            if best_slot is not None:
+                if best_shared_tok >= self.min_match_tokens:
+                    slot_tok = self.slot_state.tokens_for(best_slot)
+                    if slot_tok is not None and req_tokens >= slot_tok:
+                        self.slot_state.touch(best_slot)
+                        return best_slot
+                elif req_tokens >= int(best_shared_tok * self.min_match_ratio):
+                    self.slot_state.touch(best_slot)
+                    return best_slot
+
         # Otherwise find an empty slot (no loaded KV, safe to restore into)
         empty = self._empty_slots()
         if empty is not None and empty:
