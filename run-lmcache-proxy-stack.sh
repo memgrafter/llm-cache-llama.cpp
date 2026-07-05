@@ -195,6 +195,7 @@ proxy_args=(
   --prefix-cache-max-bytes "$PREFIX_CACHE_MAX_BYTES"
   --prefix-cache-min-free-bytes "$PREFIX_CACHE_MIN_FREE_BYTES"
 )
+if [[ -n "$PARALLEL" && "$PARALLEL" -gt 1 ]]; then proxy_args+=(--parallel "$PARALLEL"); fi
 if [[ "$NO_AUTO_SAVE" == "1" ]]; then proxy_args+=(--no-auto-save); fi
 if [[ "$NO_PREFIX_CACHE" == "1" ]]; then proxy_args+=(--no-prefix-cache); fi
 if [[ "$NO_GENERATED_PREFIX_CACHE" == "1" ]]; then proxy_args+=(--no-generated-prefix-cache); fi
