@@ -750,7 +750,7 @@ class LMCacheHandler(BaseHTTPRequestHandler):
                     self.slot_state.record(slot, node["id"], int(node.get("token_count", 0)))
                 log.info("prefix-cache restored node %s (%s tokens) via %s into slot %d",
                          node["id"], node["token_count"], via, slot)
-            return slot
+            return slot if self.slot_state is not None else None
 
         for anchor in sorted(ctx.anchors, key=lambda a: len(a.tokens), reverse=True):
             anchor_node = cache.lookup_materialized_anchor(label=anchor.config.label,
@@ -771,7 +771,7 @@ class LMCacheHandler(BaseHTTPRequestHandler):
                     log.info("prefix-cache restored node %s (%s tokens) via %s into slot %d",
                              anchor_node["id"], anchor_node["token_count"],
                              ctx.restored_via, slot)
-                return slot
+                return slot if self.slot_state is not None else None
 
             node = self._materialize_anchor_once(anchor)
             if node:
@@ -785,7 +785,7 @@ class LMCacheHandler(BaseHTTPRequestHandler):
                     self.slot_state.record(slot, node["id"], int(node.get("token_count", 0)))
                 log.info("prefix-cache using newly materialized anchor node %s (%s tokens) into slot %d",
                          node["id"], node["token_count"], slot)
-                return slot
+                return slot if self.slot_state is not None else None
 
         # No match found — in multi-slot mode, try to find an idle slot anyway
         if self.slot_state is not None:
