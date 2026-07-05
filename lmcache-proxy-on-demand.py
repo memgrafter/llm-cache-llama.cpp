@@ -18,7 +18,7 @@ import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from threading import Lock
 
 import prefix_cache
@@ -263,7 +263,10 @@ class LMCacheHandler(BaseHTTPRequestHandler):
 
     # Multi-slot routing state.
     slot_state: SlotState | None = None
-    n_parallel: int | None = None  # discovered from /slots endpoint, or None = single-slot mode"}}]}}]}}}}}}}}}}}}}}} catch (e) { log.warning(
+    n_parallel: int | None = None  # discovered from /slots endpoint, or None = single-slot mode
+
+    # Threading lock for shared mutable state (slot_state, prefix_cache_obj)
+    _cache_lock = Lock()
 
     def _forward(self, method: str, path: str, body_bytes: bytes) -> ForwardResult | None:
         """Forward request to llama.cpp, streaming response chunks to the client."""
@@ -1225,7 +1228,8 @@ class LMCacheHandler(BaseHTTPRequestHandler):
                 body = modified_body
                 body_bytes = modified_body_bytes
                 ctx = modified_ctx
-            target_slot = self._lookup_and_restore_prefix(ctx)
+            with self._cache_lock:
+                target_slot = self._lookup_and_restore_prefix(ctx)
         else:
             self._restore_legacy_cache(body)
 
@@ -1239,7 +1243,8 @@ class LMCacheHandler(BaseHTTPRequestHandler):
 
         if ctx is not None:
             try:
-                self._auto_save_prefix_cache(ctx, body, result)
+                with self._cache_lock:
+                    self._auto_save_prefix_cache(ctx, body, result)
             except Exception as e:
                 log.warning("prefix-cache autosave failed gracefully: %s", e)
         return result
@@ -1394,7 +1399,7 @@ def main():
         )
 
     try:
-        server = HTTPServer((args.host, args.port), LMCacheHandler)
+        server = ThreadingHTTPServer((args.host, args.port), LMCacheHandler)
         log.info("proxy ready — clients should point to port %d", args.port)
         server.serve_forever()
     except KeyboardInterrupt:
