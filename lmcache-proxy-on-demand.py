@@ -690,15 +690,19 @@ class LMCacheHandler(BaseHTTPRequestHandler):
 
         # If we have a node, check if any tracked slot already has it.
         # Only reuse the slot if the prefix match is substantial:
-        #   - node >= 5000 tok → match is valuable, use the slot
-        #   - node < 5000 tok → request must cover 80% of it
+        #   - node >= 5000 tok → slot must fully cover the request context
+        #     (slot tokens >= req tokens), then use it
+        #   - node < 5000 tok → request just needs to cover 80% of it
+        #     (small cache, not worth protecting)
         if node is not None and node.get("id"):
             node_tok = int(node.get("token_count", 0))
             if node_tok >= self.min_match_tokens:
                 for sid in self.slot_state.all_slot_ids():
                     if self.slot_state.node_for(sid) == node["id"]:
-                        self.slot_state.touch(sid)
-                        return sid
+                        slot_tok = self.slot_state.tokens_for(sid)
+                        if slot_tok is not None and slot_tok >= req_tokens:
+                            self.slot_state.touch(sid)
+                            return sid
             elif req_tokens >= int(node_tok * self.min_match_ratio):
                 for sid in self.slot_state.all_slot_ids():
                     if self.slot_state.node_for(sid) == node["id"]:
