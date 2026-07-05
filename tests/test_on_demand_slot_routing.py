@@ -288,8 +288,10 @@ class TestTryMakeRoom(unittest.TestCase):
         h.slot_state = _lmcp.SlotState()
         h.llama_server = "localhost"
         h.llama_port = 8081
+        h.prefix_cache_obj = None
         # Bind the method so we can call it
         h._try_make_room_for = _lmcp.LMCacheHandler._try_make_room_for.__get__(h)
+        h._evict_slot = MagicMock(return_value=True)
         return h
 
     def test_erases_small_slot_first(self):
@@ -300,6 +302,7 @@ class TestTryMakeRoom(unittest.TestCase):
         with unittest.mock.patch.object(_lmcp, "_erase_slot") as erase:
             result = h._try_make_room_for(0, {"token_count": 50000})
         self.assertEqual(result, 1)
+        h._evict_slot.assert_called_once_with(1)
         erase.assert_called_once_with(1, "localhost", 8081)
 
     def test_erases_lru_when_no_small_slot(self):
@@ -311,6 +314,7 @@ class TestTryMakeRoom(unittest.TestCase):
         with unittest.mock.patch.object(_lmcp, "_erase_slot") as erase:
             result = h._try_make_room_for(0, {"token_count": 50000})
         self.assertEqual(result, 2)
+        h._evict_slot.assert_called_once_with(2)
         erase.assert_called_once_with(2, "localhost", 8081)
 
     def test_never_erases_target_slot(self):
@@ -321,12 +325,15 @@ class TestTryMakeRoom(unittest.TestCase):
         with unittest.mock.patch.object(_lmcp, "_erase_slot") as erase:
             result = h._try_make_room_for(1, {"token_count": 50000})
         self.assertEqual(result, 0)  # erases slot 0, not target slot 1
+        h._evict_slot.assert_called_once_with(0)
 
     def test_returns_none_when_only_target_tracked(self):
         """Returns None when only the target slot is tracked."""
         h = self._make_handler()
         h.slot_state.record(0, "only-node", 50000)
         result = h._try_make_room_for(0, {"token_count": 50000})
+        self.assertIsNone(result)
+        h._evict_slot.assert_not_called()
         self.assertIsNone(result)
 
     def test_returns_none_when_no_slots_tracked(self):

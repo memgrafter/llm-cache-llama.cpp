@@ -447,6 +447,10 @@ class LMCacheHandler(BaseHTTPRequestHandler):
             log.warning("prefix-cache anchor materialize skipped: bin exists without DB node: %s", bin_path)
             return None
 
+        # Evict any loaded KV from this slot before erasing it
+        if self.slot_state and self.slot_state.has_slot(self.slot_id):
+            self._evict_slot(self.slot_id)
+            self.slot_state.forget(self.slot_id)
         if not _erase_slot(self.slot_id, self.llama_server, self.llama_port):
             return None
         prefill = _call_llama(
@@ -1068,12 +1072,14 @@ class LMCacheHandler(BaseHTTPRequestHandler):
         for sid in candidates:
             tok = self.slot_state.tokens_for(sid)
             if tok is not None and tok < 10000:
+                self._evict_slot(sid)
                 _erase_slot(sid, self.llama_server, self.llama_port)
                 self.slot_state.forget(sid)
                 return sid
         # Otherwise evict the LRU slot
         lru = self.slot_state.lru_slot()
         if lru is not None and lru != target_slot:
+            self._evict_slot(lru)
             _erase_slot(lru, self.llama_server, self.llama_port)
             self.slot_state.forget(lru)
             return lru
