@@ -748,8 +748,24 @@ class LMCacheHandler(BaseHTTPRequestHandler):
                         continue
                     slot_parent = slot_node.get("parent_id")
                     slot_tok = int(slot_node.get("token_count", 0))
-                    # Same parent + close token count (< 1% difference) = same conversation
-                    if matched_parent and slot_parent == matched_parent and abs(node_tok - slot_tok) < node_tok * 0.01:
+                    # Check for sibling/close-relative: same parent OR same grandparent,
+                    # plus close token count (< 1% difference) = same conversation.
+                    # This handles autosave creating siblings at different generations.
+                    slot_grandparent = None
+                    if slot_parent and self.prefix_cache_obj:
+                        gp_node = self.prefix_cache_obj.get_node(slot_parent)
+                        slot_grandparent = gp_node.get("parent_id") if gp_node else None
+
+                    matched_grandparent = None
+                    if matched_parent and self.prefix_cache_obj:
+                        gp_node = self.prefix_cache_obj.get_node(matched_parent)
+                        matched_grandparent = gp_node.get("parent_id") if gp_node else None
+
+                    same_close_relative = (
+                        (slot_parent == matched_parent) or
+                        (slot_grandparent and slot_grandparent == matched_grandparent)
+                    )
+                    if same_close_relative and abs(node_tok - slot_tok) < node_tok * 0.01:
                         if req_tokens >= slot_tok:
                             self.slot_state.touch(sid)
                             best_slot = sid
