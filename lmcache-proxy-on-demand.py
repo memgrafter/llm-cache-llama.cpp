@@ -592,6 +592,90 @@ class LMCacheHandler(BaseHTTPRequestHandler):
         )
         return modified, modified_ctx, json.dumps(modified, separators=(",", ":")).encode("utf-8")
 
+    def _evict_slot(self, slot_id: int) -> bool:
+        """Save the current KV state of a slot before evicting it.
+
+        Saves the slot's current state into the prefix cache so it can be
+        restored later. Returns True if the save succeeded.
+        """
+        cache = self.prefix_cache_obj
+        if cache is None:
+            return False
+
+        # Read token table from the slot to get the current token count and hash
+        tmp_file = f"prefix_evict_tmp_{time.time_ns()}.bin"
+        tmp_path = cache.absolute_bin_path(tmp_file)
+        save = _save_slot(slot_id, tmp_file, self.llama_server, self.llama_port)
+        if not isinstance(save, dict):
+            return False
+        n_saved = int(save.get("n_saved", -1))
+        if n_saved <= 0:
+            log.warning("prefix-cache eviction skipped: slot %d has no saved tokens", slot_id)
+            try:
+                tmp_path.unlink()
+            except FileNotFoundError:
+                pass
+            return False
+
+        # Read token IDs from the saved bin to compute the node hash
+        try:
+            slot_tokens = prefix_cache.read_slot_bin_tokens(tmp_path)
+        except Exception as e:
+            log.debug("prefix-cache eviction could not parse slot tokens: %s", e)
+            try:
+                tmp_path.unlink()
+            except FileNotFoundError:
+                pass
+            return False
+
+        node_id, digest = prefix_cache.node_id_for(slot_tokens)
+        bin_file = cache.relative_node_bin(node_id)
+        bin_path = cache.absolute_bin_path(bin_file)
+
+        # Check if this node already exists — if so, just unlink the temp file
+        if cache.get_node(node_id) is not None:
+            log.debug("prefix-cache eviction skipped: node %s already exists", node_id)
+            try:
+                tmp_path.unlink()
+            except FileNotFoundError:
+                pass
+            return True
+
+        # Move temp file to final location and insert node into trie
+        tmp_path.rename(bin_path)
+        size_bytes = bin_path.stat().st_size
+        props = self._props()
+        settings = props.get("default_generation_settings", {}) if isinstance(props, dict) else {}
+        parent_id = cache.parent_for(slot_tokens, node_id)
+        node = {
+            "id": node_id,
+            "parent_id": parent_id,
+            "label": "eviction",
+            "boundary": "auto-eviction",
+            "token_count": len(slot_tokens),
+            "prefix_hash": digest,
+            "hash_algo": prefix_cache.HASH_ALGO,
+            "bin_file": bin_file,
+            "size_bytes": size_bytes,
+            "n_saved": n_saved,
+            "model_alias": props.get("model_alias") if isinstance(props, dict) else None,
+            "model_path": props.get("model_path") if isinstance(props, dict) else None,
+            "ctx_size": settings.get("n_ctx") if isinstance(settings, dict) else None,
+            "hits": 0,
+            "created_at": prefix_cache.utc_now(),
+            "last_used": None,
+            "pinned": False,
+            "meta": {
+                "source": "lmcache-proxy-on-demand",
+                "eviction_slot": slot_id,
+                "save_response": save,
+            },
+        }
+        cache.insert_node(node)
+        log.info("prefix-cache evicted slot %d → node %s (%d tokens, %.1f MiB)",
+                 slot_id, node_id, len(slot_tokens), size_bytes / MIB)
+        return True
+
     def _pick_slot_for_restore(self, node: dict | None, req_tokens: int) -> int | None:
         """Pick the best slot to restore a node into.
 
@@ -626,13 +710,13 @@ class LMCacheHandler(BaseHTTPRequestHandler):
                 # Match is long enough — pick the LRU slot to overwrite
                 lru = self.slot_state.lru_slot()
                 if lru is not None:
+                    # Save the evicted slot's state before overwriting
+                    self._evict_slot(lru)
+                    self.slot_state.forget(lru)
                     return lru
 
         # Match too short to justify overwriting — skip restore entirely.
         return None
-
-        # Fallback to default slot
-        return self.slot_id
 
     def _lookup_and_restore_prefix(self, ctx: RequestCacheContext) -> int | None:
         """Restore the best matching prefix node into a slot.
