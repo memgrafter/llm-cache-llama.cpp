@@ -489,52 +489,6 @@ class PrefixCache:
             )
             db.commit()
 
-    def update_ancestors_bin(self, start_node_id: str, new_bin_file: str) -> None:
-        """Walk ancestor chain from start_node_id, updating each ancestor's
-        bin_file to point to the new descendant's file.
-
-        Immediately unlinks any old bin files that drop to zero references.
-        """
-        with contextlib.closing(self.connect()) as db:
-            node = db.execute(
-                "SELECT * FROM nodes WHERE id = ?", (start_node_id,)
-            ).fetchone()
-            while node is not None:
-                parent_row = db.execute(
-                    "SELECT * FROM nodes WHERE id = ?",
-                    (node["parent_id"],),
-                ).fetchone() if node["parent_id"] else None
-                if parent_row is None:
-                    break
-                old_bin = parent_row["bin_file"]
-                if old_bin != new_bin_file:
-                    # Update ancestor to point to descendant's file
-                    db.execute(
-                        "UPDATE nodes SET bin_file = ? WHERE id = ?",
-                        (new_bin_file, parent_row["id"]),
-                    )
-                    # Check if old file is now unreferenced
-                    remaining = int(db.execute(
-                        "SELECT COUNT(*) FROM nodes WHERE bin_file = ?",
-                        (old_bin,),
-                    ).fetchone()[0])
-                    if remaining == 0:
-                        old_path = self.absolute_bin_path(old_bin)
-                        try:
-                            old_path.unlink()
-                        except FileNotFoundError:
-                            pass
-                        log.info(
-                            "prefix-cache unlinked orphaned bin %s after ancestor update", old_bin
-                        )
-                    else:
-                        log.debug(
-                            "prefix-cache kept %s (%d remaining refs) after ancestor update",
-                            old_bin, remaining,
-                        )
-                    db.commit()
-                node = parent_row
-
     def list_nodes(self) -> list[dict[str, Any]]:
         with contextlib.closing(self.connect()) as db:
             rows = db.execute(
@@ -774,16 +728,49 @@ class PrefixCache:
                 break
 
             with contextlib.closing(chosen_cache.connect()) as db:
+                old_bin = node["bin_file"]
                 db.execute("DELETE FROM nodes WHERE id = ?", (node["id"],))
                 remaining_refs = int(
-                    db.execute("SELECT COUNT(*) FROM nodes WHERE bin_file = ?", (node["bin_file"],)).fetchone()[0]
+                    db.execute("SELECT COUNT(*) FROM nodes WHERE bin_file = ?", (old_bin,)).fetchone()[0]
                 )
                 if remaining_refs == 0:
-                    bin_path = chosen_cache.absolute_bin_path(node["bin_file"])
+                    bin_path = chosen_cache.absolute_bin_path(old_bin)
                     try:
                         bin_path.unlink()
                     except FileNotFoundError:
                         pass
+                else:
+                    # Other nodes (ancestors) still reference this file — can't unlink.
+                    # Redirect them to the largest available alternative file so we
+                    # can actually free disk space. Any file with >= ancestor's
+                    # token_count works because llama.cpp uses prefix matching.
+                    alt_row = db.execute(
+                        """
+                        SELECT bf.bin_file, MAX(bf.token_count) AS max_tokens
+                        FROM nodes bf
+                        WHERE bf.bin_file != ?
+                        GROUP BY bf.bin_file
+                        ORDER BY max_tokens DESC
+                        LIMIT 1
+                        """,
+                        (old_bin,),
+                    ).fetchone()
+                    if alt_row is not None:
+                        alt_bin = alt_row[0]
+                        db.execute(
+                            "UPDATE nodes SET bin_file = ? WHERE bin_file = ?",
+                            (alt_bin, old_bin),
+                        )
+                        log.info(
+                            "prefix-cache prune redirected %d ancestor(s) from %s → %s",
+                            remaining_refs, old_bin, alt_bin,
+                        )
+                        bin_path = chosen_cache.absolute_bin_path(old_bin)
+                        try:
+                            bin_path.unlink()
+                        except FileNotFoundError:
+                            pass
+                    # else: no alternative file available, can't unlink yet
                 db.commit()
         return removed
 
@@ -885,16 +872,46 @@ class PrefixCache:
                 if dry_run:
                     # Simulate only one candidate in dry-run to avoid fake totals.
                     break
+                old_bin = node["bin_file"]
                 db.execute("DELETE FROM nodes WHERE id = ?", (node["id"],))
                 remaining_refs = int(
-                    db.execute("SELECT COUNT(*) FROM nodes WHERE bin_file = ?", (node["bin_file"],)).fetchone()[0]
+                    db.execute("SELECT COUNT(*) FROM nodes WHERE bin_file = ?", (old_bin,)).fetchone()[0]
                 )
                 if remaining_refs == 0:
-                    bin_path = self.absolute_bin_path(node["bin_file"])
+                    bin_path = self.absolute_bin_path(old_bin)
                     try:
                         bin_path.unlink()
                     except FileNotFoundError:
                         pass
+                else:
+                    # Other nodes (ancestors) still reference this file — can't unlink.
+                    # Redirect them to the largest available alternative file.
+                    alt_row = db.execute(
+                        """
+                        SELECT bf.bin_file, MAX(bf.token_count) AS max_tokens
+                        FROM nodes bf
+                        WHERE bf.bin_file != ?
+                        GROUP BY bf.bin_file
+                        ORDER BY max_tokens DESC
+                        LIMIT 1
+                        """,
+                        (old_bin,),
+                    ).fetchone()
+                    if alt_row is not None:
+                        alt_bin = alt_row[0]
+                        db.execute(
+                            "UPDATE nodes SET bin_file = ? WHERE bin_file = ?",
+                            (alt_bin, old_bin),
+                        )
+                        log.info(
+                            "prefix-cache prune redirected %d ancestor(s) from %s → %s",
+                            remaining_refs, old_bin, alt_bin,
+                        )
+                        bin_path = self.absolute_bin_path(old_bin)
+                        try:
+                            bin_path.unlink()
+                        except FileNotFoundError:
+                            pass
                 db.commit()
         return removed
 
