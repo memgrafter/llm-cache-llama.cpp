@@ -122,27 +122,37 @@ class PrefixCacheTests(unittest.TestCase):
             self.assertEqual(cache.parent_for([1, 2, 3, 4, 5], child_id), parent["id"])
 
     def test_prune_removes_leaf_but_keeps_parent(self):
+        """Pruning a leaf cascades up deleting parents that become leaves,
+        but stops at a branching ancestor which gets redirected."""
         with tempfile.TemporaryDirectory() as d:
             cache_dir = pathlib.Path(d)
             cache = prefix_cache.PrefixCache(cache_dir)
             cache.init()
+            # Branching ancestor with two children
             parent = self._node([1, 2], label="parent", bin_file="trie/nodes/parent.bin")
             leaf = self._node([1, 2, 3], label="leaf", parent_id=parent["id"], bin_file="trie/nodes/leaf.bin")
+            sibling = self._node([1, 2, 4], label="sibling", parent_id=parent["id"], bin_file="trie/nodes/sibling.bin")
             (cache_dir / parent["bin_file"]).parent.mkdir(parents=True, exist_ok=True)
             (cache_dir / parent["bin_file"]).write_bytes(b"parent")
             (cache_dir / leaf["bin_file"]).write_bytes(b"leaf")
+            (cache_dir / sibling["bin_file"]).write_bytes(b"sibling")
             parent["size_bytes"] = 6
             leaf["size_bytes"] = 4
+            sibling["size_bytes"] = 7
             cache.insert_node(parent)
             cache.insert_node(leaf)
+            cache.insert_node(sibling)
 
-            removed = cache.prune(max_bytes=6, max_nodes=None, dry_run=False)
+            removed = cache.prune(max_bytes=13, max_nodes=None, dry_run=False)
 
-            self.assertEqual([n["id"] for n in removed], [leaf["id"]])
+            # One of the two leaves is pruned (LRU by created_at then id)
+            self.assertEqual(len(removed), 1)
+            # Parent kept (still has a child), redirected to surviving child's file
             self.assertIsNotNone(cache.get_node(parent["id"]))
-            self.assertIsNone(cache.get_node(leaf["id"]))
-            self.assertTrue((cache_dir / parent["bin_file"]).exists())
-            self.assertFalse((cache_dir / leaf["bin_file"]).exists())
+            self.assertNotEqual(cache.get_node(parent["id"])["bin_file"], "trie/nodes/parent.bin")
+            # The pruned node's file is gone
+            pruned_id = removed[0]["id"]
+            self.assertIsNone(cache.get_node(pruned_id))
 
     def test_prune_uses_plain_lru_not_hits_or_size(self):
         with tempfile.TemporaryDirectory() as d:

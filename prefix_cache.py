@@ -774,16 +774,58 @@ class PrefixCache:
                 break
 
             with contextlib.closing(chosen_cache.connect()) as db:
-                db.execute("DELETE FROM nodes WHERE id = ?", (node["id"],))
-                remaining_refs = int(
-                    db.execute("SELECT COUNT(*) FROM nodes WHERE bin_file = ?", (node["bin_file"],)).fetchone()[0]
-                )
-                if remaining_refs == 0:
-                    bin_path = chosen_cache.absolute_bin_path(node["bin_file"])
-                    try:
-                        bin_path.unlink()
-                    except FileNotFoundError:
-                        pass
+                # Cascade: delete the leaf, then walk up deleting parents that
+                # become leaves too. Stop at a branching ancestor and redirect
+                # it to a surviving child's file so all old files can unlink.
+                cur_id = node["id"]
+                bins_to_check = []  # (bin_file, absolute_path) pairs
+                while True:
+                    cur = db.execute(
+                        "SELECT * FROM nodes WHERE id = ?", (cur_id,)
+                    ).fetchone()
+                    if cur is None:
+                        break
+                    bins_to_check.append((cur["bin_file"], chosen_cache.absolute_bin_path(cur["bin_file"])))
+                    db.execute("DELETE FROM nodes WHERE id = ?", (cur_id,))
+                    # Check if parent is now a leaf
+                    parent_id = cur["parent_id"]
+                    if parent_id is None:
+                        break
+                    child_count = int(db.execute(
+                        "SELECT COUNT(*) FROM nodes WHERE parent_id = ?",
+                        (parent_id,),
+                    ).fetchone()[0])
+                    if child_count > 0:
+                        # Parent still has children — redirect it to a surviving
+                        # child's file, then stop
+                        child_row = db.execute(
+                            "SELECT bin_file FROM nodes WHERE parent_id = ? LIMIT 1",
+                            (parent_id,),
+                        ).fetchone()
+                        if child_row is not None:
+                            db.execute(
+                                "UPDATE nodes SET bin_file = ? WHERE id = ?",
+                                (child_row["bin_file"], parent_id),
+                            )
+                        break
+                    # Budget check: if already under budget after this deletion,
+                    # don't cascade further — leave the parent in place
+                    total_bytes = chosen_cache._total_bytes_in_db(db)
+                    total_nodes = int(db.execute("SELECT COUNT(*) FROM nodes").fetchone()[0])
+                    if (max_bytes is None or total_bytes <= max_bytes) and \
+                       (max_nodes is None or total_nodes <= max_nodes):
+                        break
+                    cur_id = parent_id
+                # Unlink old files that dropped to zero refs
+                for bf, bp in bins_to_check:
+                    remaining = int(db.execute(
+                        "SELECT COUNT(*) FROM nodes WHERE bin_file = ?", (bf,),
+                    ).fetchone()[0])
+                    if remaining == 0:
+                        try:
+                            bp.unlink()
+                        except FileNotFoundError:
+                            pass
                 db.commit()
         return removed
 
@@ -885,16 +927,58 @@ class PrefixCache:
                 if dry_run:
                     # Simulate only one candidate in dry-run to avoid fake totals.
                     break
-                db.execute("DELETE FROM nodes WHERE id = ?", (node["id"],))
-                remaining_refs = int(
-                    db.execute("SELECT COUNT(*) FROM nodes WHERE bin_file = ?", (node["bin_file"],)).fetchone()[0]
-                )
-                if remaining_refs == 0:
-                    bin_path = self.absolute_bin_path(node["bin_file"])
-                    try:
-                        bin_path.unlink()
-                    except FileNotFoundError:
-                        pass
+                # Cascade: delete the leaf, then walk up deleting parents that
+                # become leaves too. Stop at a branching ancestor and redirect
+                # it to a surviving child's file so all old files can unlink.
+                cur_id = node["id"]
+                bins_to_check = []  # (bin_file, absolute_path) pairs
+                while True:
+                    cur = db.execute(
+                        "SELECT * FROM nodes WHERE id = ?", (cur_id,)
+                    ).fetchone()
+                    if cur is None:
+                        break
+                    bins_to_check.append((cur["bin_file"], self.absolute_bin_path(cur["bin_file"])))
+                    db.execute("DELETE FROM nodes WHERE id = ?", (cur_id,))
+                    # Check if parent is now a leaf
+                    parent_id = cur["parent_id"]
+                    if parent_id is None:
+                        break
+                    child_count = int(db.execute(
+                        "SELECT COUNT(*) FROM nodes WHERE parent_id = ?",
+                        (parent_id,),
+                    ).fetchone()[0])
+                    if child_count > 0:
+                        # Parent still has children — redirect it to a surviving
+                        # child's file, then stop
+                        child_row = db.execute(
+                            "SELECT bin_file FROM nodes WHERE parent_id = ? LIMIT 1",
+                            (parent_id,),
+                        ).fetchone()
+                        if child_row is not None:
+                            db.execute(
+                                "UPDATE nodes SET bin_file = ? WHERE id = ?",
+                                (child_row["bin_file"], parent_id),
+                            )
+                        break
+                    # Budget check: if already under budget after this deletion,
+                    # don't cascade further — leave the parent in place
+                    total_bytes = self._total_bytes_in_db(db)
+                    total_nodes = int(db.execute("SELECT COUNT(*) FROM nodes").fetchone()[0])
+                    if (max_bytes is None or total_bytes <= max_bytes) and \
+                       (max_nodes is None or total_nodes <= max_nodes):
+                        break
+                    cur_id = parent_id
+                # Unlink old files that dropped to zero refs
+                for bf, bp in bins_to_check:
+                    remaining = int(db.execute(
+                        "SELECT COUNT(*) FROM nodes WHERE bin_file = ?", (bf,),
+                    ).fetchone()[0])
+                    if remaining == 0:
+                        try:
+                            bp.unlink()
+                        except FileNotFoundError:
+                            pass
                 db.commit()
         return removed
 
