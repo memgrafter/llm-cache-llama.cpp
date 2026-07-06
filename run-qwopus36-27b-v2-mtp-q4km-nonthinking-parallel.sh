@@ -9,7 +9,8 @@ export MODEL="${MODEL:-$MODELS_DIR/Qwopus3.6-27B-v2-MTP-Q4_K_M.gguf}"
 export ALIAS="${ALIAS:-local-model,Qwopus3.6-27B-v2-MTP-Q4_K_M}"
 export CACHE_DIR="${CACHE_DIR:-$HOME/.cache/llama.cpp-launch-scripts/qwopus36-27b-v2-mtp-q4km-nonthinking}"
 export KV_UNIFIED="true"  # each slot gets full n_ctx, VRAM scales with actual usage
-export CTX="${CTX:-360000}" # KV_UNIFIED=true means this is the pooled ctx of PARALLEL, in this case 2*120000 total, but each can use up to 240000
+#export CTX="${CTX:-360000}" # KV_UNIFIED=true means this is the pooled ctx of PARALLEL, in this case 2*120000 total, but each can use up to 240000
+export CTX="${CTX:-240000}"
 #export CTX="${CTX:-160000}"
 export BATCH="${BATCH:-4096}"
 #export UBATCH="${UBATCH:-4096}"
@@ -23,9 +24,9 @@ else
   export CACHE_V="${CACHE_V:-turbo3}"
 fi
 export SPEC_TYPE="${SPEC_TYPE:-ngram-mod}"
-#export MTP="${MTP:-3}"
+export MTP="${MTP:-2}"
 export REASONING="${REASONING:-off}"
-export PARALLEL="${PARALLEL:-3}"
+export PARALLEL="${PARALLEL:-2}"
 #export PARALLEL="${PARALLEL:-2}"
 export PREFIX_CACHE_MAX_BYTES="${PREFIX_CACHE_MAX_BYTES:-100GiB}"
 export EXTRA_FLAGS="${EXTRA_FLAGS:---no-mmproj}"

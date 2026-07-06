@@ -149,6 +149,7 @@ if [[ "$SERVE" == "1" ]]; then
     --no-warmup
     --reasoning "${REASONING:-on}"
     --metrics
+    --reasoning-preserve
   )
 
   if [[ -n "${REASONING_MAX_TOKENS:-}" ]]; then
