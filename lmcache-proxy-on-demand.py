@@ -181,6 +181,8 @@ class SlotState:
         self._slot_node_id: dict[int, str] = {}   # slot_id → node_id of loaded KV
         self._slot_tokens: dict[int, int] = {}     # slot_id → token count in loaded KV
         self._slot_time: dict[int, float] = {}     # slot_id → last-used monotonic time
+        self._slot_busy: dict[int, bool] = {}      # slot_id → is busy (proxy-side)
+        self._slot_locks: dict[int, Lock] = {}     # slot_id → per-slot lock
         self._lock = Lock()
 
     def record(self, slot_id: int, node_id: str, token_count: int) -> None:
@@ -201,6 +203,8 @@ class SlotState:
             self._slot_node_id.pop(slot_id, None)
             self._slot_tokens.pop(slot_id, None)
             self._slot_time.pop(slot_id, None)
+            self._slot_busy.pop(slot_id, None)
+            self._slot_locks.pop(slot_id, None)
 
     def has_slot(self, slot_id: int) -> bool:
         """Whether we are tracking this slot."""
@@ -234,6 +238,37 @@ class SlotState:
         with self._lock:
             tracked = set(self._slot_node_id.keys())
             return [s for s in available if s not in tracked]
+
+    def acquire_slot(self, slot_id: int) -> bool:
+        """Try to acquire a slot for exclusive use.
+
+        Returns True if the slot was acquired, False if already busy.
+        Creates a per-slot lock if needed.
+        """
+        with self._lock:
+            if self._slot_busy.get(slot_id, False):
+                return False
+            if slot_id not in self._slot_locks:
+                self._slot_locks[slot_id] = Lock()
+            self._slot_busy[slot_id] = True
+        # Acquire the per-slot lock outside _lock to avoid deadlock
+        self._slot_locks[slot_id].acquire()
+        return True
+
+    def release_slot(self, slot_id: int) -> None:
+        """Release a slot after processing completes."""
+        with self._lock:
+            if slot_id in self._slot_locks:
+                try:
+                    self._slot_locks[slot_id].release()
+                except RuntimeError:
+                    pass  # Lock was already released
+            self._slot_busy[slot_id] = False
+
+    def is_slot_busy(self, slot_id: int) -> bool:
+        """Check if a slot is currently in use."""
+        with self._lock:
+            return self._slot_busy.get(slot_id, False)
 
 
 class LMCacheHandler(BaseHTTPRequestHandler):
@@ -718,6 +753,7 @@ class LMCacheHandler(BaseHTTPRequestHandler):
             # For each slot, find the deepest ancestor it holds
             best_slot = None
             best_shared_tok = 0
+            best_shared_node_id = None
             for sid in self.slot_state.all_slot_ids():
                 slot_node = self.slot_state.node_for(sid)
                 if slot_node is None:
@@ -730,16 +766,21 @@ class LMCacheHandler(BaseHTTPRequestHandler):
                         if anc_tok > best_shared_tok:
                             best_shared_tok = anc_tok
                             best_slot = sid
+                            best_shared_node_id = anc_id
                         break  # found deepest match for this slot, move on
 
             if best_slot is not None:
-                # Reuse slot only if request covers the slot's loaded prefix.
-                slot_tok = self.slot_state.tokens_for(best_slot)
-                if slot_tok is not None and req_tokens >= slot_tok:
-                    self.slot_state.touch(best_slot)
-                    # Ancestor match: slot already has a prefix of the matched node.
-                    # llama.cpp can compute the delta from its existing prefix — no restore needed.
-                    return (best_slot, False)
+                # Skip if the slot is busy from another request — fall through to empty slots
+                if self.slot_state.is_slot_busy(best_slot):
+                    log.debug("prefix-cache ancestor match slot %d busy, skipping", best_slot)
+                    best_slot = None
+                else:
+                    # Reuse slot only if request covers the slot's loaded prefix.
+                    slot_tok = self.slot_state.tokens_for(best_slot)
+                    if slot_tok is not None and req_tokens >= slot_tok:
+                        # Record the matched node as the slot's current state.
+                        self.slot_state.record(best_slot, best_shared_node_id, best_shared_tok)
+                        return (best_slot, False)
 
             # No ancestor match — check for sibling nodes (same parent, close token count).
             # This happens when autosave creates a node whose parent_for couldn't find
@@ -780,13 +821,18 @@ class LMCacheHandler(BaseHTTPRequestHandler):
                             break
 
             if best_slot is not None:
-                # Reuse slot only if request covers the slot's loaded prefix.
-                slot_tok = self.slot_state.tokens_for(best_slot)
-                if slot_tok is not None and req_tokens >= slot_tok:
-                    self.slot_state.touch(best_slot)
-                    # Sibling match: same conversation but different node (autosave gap).
-                    # Must restore to get the correct prefix loaded.
-                    return (best_slot, True)
+                # Skip if the slot is busy from another request — fall through to empty slots
+                if self.slot_state.is_slot_busy(best_slot):
+                    log.debug("prefix-cache sibling match slot %d busy, skipping", best_slot)
+                    best_slot = None
+                else:
+                    # Reuse slot only if request covers the slot's loaded prefix.
+                    slot_tok = self.slot_state.tokens_for(best_slot)
+                    if slot_tok is not None and req_tokens >= slot_tok:
+                        self.slot_state.touch(best_slot)
+                        # Sibling match: same conversation but different node (autosave gap).
+                        # Must restore to get the correct prefix loaded.
+                        return (best_slot, True)
 
         # Otherwise find an empty slot (no loaded KV, safe to restore into)
         empty = self._empty_slots()
@@ -1043,7 +1089,11 @@ class LMCacheHandler(BaseHTTPRequestHandler):
         slots = self._discover_slots()
         if slots is None:
             return None
-        return [s["id"] for s in slots if not s.get("is_busy", False)]
+        backend_idle = [s["id"] for s in slots if not s.get("is_busy", False)]
+        # Also filter out slots that are busy from the proxy's perspective
+        proxy_idle = [sid for sid in backend_idle
+                      if not self.slot_state.is_slot_busy(sid)]
+        return proxy_idle
 
     def _empty_slots(self) -> list[int] | None:
         """Return ids of slots that are truly empty (idle + not tracked in slot_state).
@@ -1411,6 +1461,7 @@ class LMCacheHandler(BaseHTTPRequestHandler):
             return self._forward(method, path, body_bytes)
 
         target_slot: int | None = None
+        acquired = False  # tracks whether we hold a per-slot lock
         ctx = self._request_cache_context(path, body) if method == "POST" else None
         if ctx is not None:
             modified_body, modified_ctx, modified_body_bytes = self._maybe_apply_exact_prefix_newline_workaround(path, body, ctx)
@@ -1420,6 +1471,14 @@ class LMCacheHandler(BaseHTTPRequestHandler):
                 ctx = modified_ctx
             with self._cache_lock:
                 target_slot = self._lookup_and_restore_prefix(ctx)
+                # Acquire slot lock inside _cache_lock so the busy flag is set
+                # before another thread can route to the same slot
+                acquired = False
+                if target_slot is not None and self.slot_state is not None:
+                    acquired = self.slot_state.acquire_slot(target_slot)
+                    if not acquired:
+                        log.warning("slot %d busy, re-routing", target_slot)
+                        target_slot = None
         else:
             self._restore_legacy_cache(body)
 
@@ -1429,7 +1488,12 @@ class LMCacheHandler(BaseHTTPRequestHandler):
             body_bytes = json.dumps(body, separators=(",", ":")).encode("utf-8")
             log.debug("routed to slot %d", target_slot)
 
-        result = self._forward(method, path, body_bytes)
+        try:
+            result = self._forward(method, path, body_bytes)
+        finally:
+            # Always release the slot lock after forwarding completes
+            if acquired and self.slot_state is not None:
+                self.slot_state.release_slot(target_slot)
 
         if ctx is not None:
             try:
