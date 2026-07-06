@@ -131,6 +131,12 @@ args=(
     args+=(--device "$DEVICE")
   fi
 
+# Multi-GPU split mode. Set by the wrapper script via SPLIT_MODE env var.
+# Only passed when explicitly set; otherwise llama.cpp uses its own default.
+if [[ -n "${SPLIT_MODE:-}" ]]; then
+  args+=(--split-mode "$SPLIT_MODE")
+fi
+
 if [[ "$SERVE" == "1" ]]; then
   [[ -n "$SLOT_SAVE_PATH" ]] && mkdir -p "$SLOT_SAVE_PATH"
 
@@ -249,7 +255,7 @@ else
   echo "CONVERSATION=$CONVERSATION SINGLE_TURN=$SINGLE_TURN SIMPLE_IO=$SIMPLE_IO DISPLAY_PROMPT=$DISPLAY_PROMPT PROMPT_FILE=${PROMPT_FILE:-<none>}"
 fi
 echo "SPEC_NGRAM_MOD_N_MATCH=$SPEC_NGRAM_MOD_N_MATCH SPEC_NGRAM_MOD_N_MIN=$SPEC_NGRAM_MOD_N_MIN_EFFECTIVE SPEC_NGRAM_MOD_N_MAX=$SPEC_NGRAM_MOD_N_MAX_EFFECTIVE"
-echo "TURBOQUANT=$TURBOQUANT TURBOQUANT_FLAGS=${TURBOQUANT_FLAGS:-<auto/implicit>} EXTRA_FLAGS=${EXTRA_FLAGS:-<none>}"
+echo "TURBOQUANT=$TURBOQUANT TURBOQUANT_FLAGS=${TURBOQUANT_FLAGS:-<auto/implicit>} EXTRA_FLAGS=${EXTRA_FLAGS:-<none>} SPLIT_MODE=${SPLIT_MODE:-<unset>}"
 echo
 
 # CPU pinning. Set by the proxy stack via env vars.

@@ -73,6 +73,7 @@ export KV_OFFLOAD="${KV_OFFLOAD:-1}"
 export MLOCK="${MLOCK:-0}"
 export TURBOQUANT="${TURBOQUANT:-1}"
 export TURBOQUANT_FLAGS="${TURBOQUANT_FLAGS:-}"
+export SPLIT_MODE="${SPLIT_MODE:-}"
 export BACKEND_SCRIPT="${BACKEND_SCRIPT:-_llama-engine.sh}"
 
 LOG_DIR="${LOG_DIR:-$SCRIPT_DIR/logs}"
