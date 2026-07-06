@@ -1,0 +1,22 @@
+[Unit]
+Description=Start llama.cpp serving stack in tmux
+Documentation=man:tmux(1)
+After=network-online.target nvidia-persistenced.service thermal-throttle-3090ti.service
+Wants=network-online.target nvidia-persistenced.service thermal-throttle-3090ti.service
+
+[Service]
+Type=oneshot
+User=__USER__
+Group=__USER__
+WorkingDirectory=__WORKDIR__
+Environment=HOME=__HOME__
+Environment=TERM=xterm-256color
+Environment=PUBLIC_HOST=0.0.0.0
+ExecStartPre=-/usr/bin/tmux kill-session -t llama_cpp-serving
+ExecStart=/bin/bash -c 'tmux new-session -d -s llama_cpp-serving -c __WORKDIR__ -n qwopus \
+    /usr/bin/bash -lc ./run-qwopus36-27b-v2-mtp-q4km-nonthinking-parallel.sh'
+ExecStop=-/usr/bin/tmux kill-session -t llama_cpp-serving
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
