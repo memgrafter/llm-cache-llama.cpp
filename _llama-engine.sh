@@ -112,6 +112,7 @@ fi
 
 args=(
   --model "$MODEL"
+  --no-mmap
   --ctx-size "$CTX"
   --gpu-layers "$NGL"
   --threads "$THREADS"
