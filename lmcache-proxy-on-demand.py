@@ -564,6 +564,9 @@ class LMCacheHandler(BaseHTTPRequestHandler):
                 "anchor_tokens": anchor.tokens,
             },
         })
+        # Record that the slot has this anchor loaded — prefill just wrote it.
+        if self.slot_state is not None:
+            self.slot_state.record(self.slot_id, node_id, len(anchor.tokens))
         log.info("prefix-cache materialized anchor node %s (%d tokens, %.1f MiB)", node_id, len(anchor.tokens), size_bytes / MIB)
         return cache.get_node(node_id)
 
@@ -770,19 +773,56 @@ class LMCacheHandler(BaseHTTPRequestHandler):
                         break  # found deepest match for this slot, move on
 
             if best_slot is not None:
-                # Skip if the slot is busy from another request — fall through to empty slots
+                # Skip if the slot is busy from another request — fall through
                 if self.slot_state.is_slot_busy(best_slot):
                     log.debug("prefix-cache ancestor match slot %d busy, skipping", best_slot)
                     best_slot = None
                 else:
-                    # Reuse slot only if request covers the slot's loaded prefix.
-                    slot_tok = self.slot_state.tokens_for(best_slot)
-                    if slot_tok is not None and req_tokens >= slot_tok:
-                        # Record the matched node as the slot's current state.
-                        self.slot_state.record(best_slot, best_shared_node_id, best_shared_tok)
-                        return (best_slot, False)
+                    # Ancestor match: slot already holds a prefix of the matched node.
+                    # llama.cpp can compute the delta from its existing prefix —
+                    # no restore needed regardless of token count comparison.
+                    self.slot_state.record(best_slot, best_shared_node_id, best_shared_tok)
+                    return (best_slot, False)
 
-            # No ancestor match — check for sibling nodes (same parent, close token count).
+            # No ancestor match — check if any slot holds a descendant of the matched node.
+            # This happens when autosave lags: the slot has more context than the matched
+            # node (e.g., 111k tokens vs 5k anchor) but is from the same conversation.
+            if best_slot is None and self.prefix_cache_obj is not None:
+                for sid in self.slot_state.all_slot_ids():
+                    slot_node_id = self.slot_state.node_for(sid)
+                    if slot_node_id is None:
+                        continue
+                    # Walk up from the slot's node — if we hit the matched node or
+                    # one of its ancestors, the slot holds a descendant.
+                    cur_id = slot_node_id
+                    while cur_id:
+                        if cur_id == node["id"]:
+                            # Slot holds a descendant of the matched node — reuse it.
+                            slot_tok = self.slot_state.tokens_for(sid)
+                            self.slot_state.touch(sid)
+                            best_slot = sid
+                            best_shared_node_id = node["id"]
+                            best_shared_tok = int(node.get("token_count", 0))
+                            break
+                        cur_node = self.prefix_cache_obj.get_node(cur_id)
+                        if cur_node is None:
+                            break
+                        cur_id = cur_node.get("parent_id")
+                    if best_slot is not None:
+                        break
+
+            if best_slot is not None:
+                # Skip if the slot is busy from another request — fall through
+                if self.slot_state.is_slot_busy(best_slot):
+                    log.debug("prefix-cache descendant match slot %d busy, skipping", best_slot)
+                    best_slot = None
+                else:
+                    # Descendant match: slot holds more context than the matched node.
+                    # llama.cpp can use its existing prefix — no restore needed.
+                    self.slot_state.record(best_slot, best_shared_node_id, best_shared_tok)
+                    return (best_slot, False)
+
+            # No descendant match — check for sibling nodes (same parent, close token count).
             # This happens when autosave creates a node whose parent_for couldn't find
             # the restored slot's node (not saved to trie yet), making them siblings.
             if best_slot is None and self.prefix_cache_obj is not None:
@@ -814,25 +854,21 @@ class LMCacheHandler(BaseHTTPRequestHandler):
                         (slot_grandparent and slot_grandparent == matched_grandparent)
                     )
                     if same_close_relative and abs(node_tok - slot_tok) < node_tok * 0.01:
-                        if req_tokens >= slot_tok:
-                            self.slot_state.touch(sid)
-                            best_slot = sid
-                            best_shared_tok = slot_tok
-                            break
+                        self.slot_state.touch(sid)
+                        best_slot = sid
+                        best_shared_tok = slot_tok
+                        break
 
             if best_slot is not None:
-                # Skip if the slot is busy from another request — fall through to empty slots
+                # Skip if the slot is busy from another request — fall through
                 if self.slot_state.is_slot_busy(best_slot):
                     log.debug("prefix-cache sibling match slot %d busy, skipping", best_slot)
                     best_slot = None
                 else:
-                    # Reuse slot only if request covers the slot's loaded prefix.
-                    slot_tok = self.slot_state.tokens_for(best_slot)
-                    if slot_tok is not None and req_tokens >= slot_tok:
-                        self.slot_state.touch(best_slot)
-                        # Sibling match: same conversation but different node (autosave gap).
-                        # Must restore to get the correct prefix loaded.
-                        return (best_slot, True)
+                    # Sibling match: same conversation but different node (autosave gap).
+                    # Must restore to get the correct prefix loaded.
+                    self.slot_state.touch(best_slot)
+                    return (best_slot, True)
 
         # Otherwise find an empty slot (no loaded KV, safe to restore into)
         empty = self._empty_slots()
@@ -840,17 +876,11 @@ class LMCacheHandler(BaseHTTPRequestHandler):
             return (empty[0], True)
 
         # No idle slots — evict to make room.
-        # Prefer evicting a slot with a small loaded node (< 10000 tok),
-        # otherwise evict the LRU slot.
+        # Use LRU: the least-recently-written slot is the one least likely
+        # to be actively in use by another client (all traffic goes through
+        # the proxy, so _slot_time is authoritative).
         if node is not None:
-            target = None
-            for sid in self.slot_state.all_slot_ids():
-                slot_tok = self.slot_state.tokens_for(sid)
-                if slot_tok is not None and slot_tok < 10000:
-                    target = sid
-                    break
-            if target is None:
-                target = self.slot_state.lru_slot()
+            target = self.slot_state.lru_slot()
             if target is not None:
                 self._evict_slot(target)
                 self.slot_state.forget(target)
@@ -982,14 +1012,31 @@ class LMCacheHandler(BaseHTTPRequestHandler):
                 if isinstance(slot_result, tuple):
                     slot, needs_restore = slot_result
                 else:
-                    slot, needs_restore = slot_result, True
+                    # Single-slot mode: slot is self.slot_id which just had the
+                    # anchor prefilled — no restore needed.
+                    slot, needs_restore = slot_result, False
                 ctx.restored_node_id = node["id"]
                 ctx.restored_via = f"anchor-materialized:{anchor.config.label}"
-                if self.slot_state is not None:
-                    self.slot_state.record(slot, node["id"], int(node.get("token_count", 0)))
-                log.info("prefix-cache using newly materialized anchor node %s (%s tokens) into slot %d (needs_restore=%s)",
-                         node["id"], node["token_count"], slot, needs_restore)
-                return slot if self.slot_state is not None else None
+
+                if needs_restore:
+                    # Slot doesn't have this anchor — restore it.
+                    result = _restore_slot(slot, node["bin_file"], self.llama_server, self.llama_port)
+                    if result:
+                        if self.slot_state is not None:
+                            self.slot_state.record(slot, node["id"], int(node.get("token_count", 0)))
+                        log.info("prefix-cache restored newly materialized anchor %s (%s tokens) into slot %d",
+                                 node["id"], node["token_count"], slot)
+                        return slot if self.slot_state is not None else None
+                    log.warning("prefix-cache materialized anchor restore failed for slot %d", slot)
+                    continue
+                else:
+                    # Slot already has the anchor (prefill in single-slot mode,
+                    # or ancestor match in multi-slot mode).
+                    if self.slot_state is not None:
+                        self.slot_state.record(slot, node["id"], int(node.get("token_count", 0)))
+                    log.info("prefix-cache routing to slot %d (no restore needed, materialized anchor %s)",
+                             slot, node["id"])
+                    return slot if self.slot_state is not None else None
 
         # No match found — in multi-slot mode, try to find an idle slot anyway
         if self.slot_state is not None:
@@ -1490,17 +1537,18 @@ class LMCacheHandler(BaseHTTPRequestHandler):
 
         try:
             result = self._forward(method, path, body_bytes)
+            # Autosave while still holding the slot lock — ensures trie is up to date
+            # before the next request can acquire the lock and do its lookup
+            if ctx is not None:
+                try:
+                    with self._cache_lock:
+                        self._auto_save_prefix_cache(ctx, body, result, target_slot)
+                except Exception as e:
+                    log.warning("prefix-cache autosave failed gracefully: %s", e)
         finally:
-            # Always release the slot lock after forwarding completes
+            # Always release the slot lock after forwarding + autosave completes
             if acquired and self.slot_state is not None:
                 self.slot_state.release_slot(target_slot)
-
-        if ctx is not None:
-            try:
-                with self._cache_lock:
-                    self._auto_save_prefix_cache(ctx, body, result, target_slot)
-            except Exception as e:
-                log.warning("prefix-cache autosave failed gracefully: %s", e)
         return result
 
     def _check_compatibility(self, meta: dict) -> bool:

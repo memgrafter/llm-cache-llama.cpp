@@ -70,9 +70,9 @@ class TestPickSlotForRestore(unittest.TestCase):
         result = h._pick_slot_for_restore(node, 6000)
         self.assertEqual(result, (0, False))
 
-    def test_slot_not_exhausted_falls_through_to_eviction(self):
-        """Slot with node >= 5000 tok but request doesn't exhaust slot prefix → not reused,
-        eviction kicks in and returns a slot."""
+    def test_slot_not_exhausted_ancestor_match_accepted(self):
+        """Ancestor match is accepted unconditionally — request shorter than slot
+        prefix doesn't matter; llama.cpp computes the delta."""
         state = SlotState()
         state.record(0, "node-A", 6000)  # slot has more tokens than request
         nodes = {
@@ -81,10 +81,10 @@ class TestPickSlotForRestore(unittest.TestCase):
         h = make_handler(state=state, discover_slots=[{"id": 0, "is_busy": True}], mock_evict=True, nodes=nodes)
         node = {"id": "node-A", "parent_id": None, "token_count": 6000}
 
-        # Request (4000) doesn't cover slot prefix (6000) → not reused, falls to eviction
+        # Ancestor match — accepted regardless of token count comparison
         result = h._pick_slot_for_restore(node, 4000)
-        self.assertEqual(result, (0, True))  # eviction returns slot 0, needs restore
-        h._evict_slot.assert_called_with(0)
+        self.assertEqual(result, (0, False))  # no restore needed
+        h._evict_slot.assert_not_called()
 
     def test_reuses_small_node_when_request_covers_slot(self):
         """Slot reused only when request covers the slot's loaded prefix."""
@@ -99,9 +99,9 @@ class TestPickSlotForRestore(unittest.TestCase):
         result = h._pick_slot_for_restore(node, 3500)  # >= slot tokens, ancestor match → no restore
         self.assertEqual(result, (0, False))
 
-    def test_request_shorter_than_slot_falls_through_to_eviction(self):
-        """When request is shorter than slot's loaded prefix, slot not reused,
-        eviction kicks in and returns a slot."""
+    def test_request_shorter_than_slot_ancestor_match_accepted(self):
+        """Ancestor match is accepted unconditionally — request shorter than slot
+        prefix doesn't matter; llama.cpp computes the delta."""
         state = SlotState()
         state.record(0, "node-B", 3000)
         nodes = {
@@ -110,16 +110,19 @@ class TestPickSlotForRestore(unittest.TestCase):
         h = make_handler(state=state, discover_slots=[{"id": 0, "is_busy": True}], mock_evict=True, nodes=nodes)
         node = {"id": "node-B", "parent_id": None, "token_count": 3000}
 
-        result = h._pick_slot_for_restore(node, 2000)  # < slot tokens, falls to eviction
-        self.assertEqual(result, (0, True))  # eviction returns slot 0, needs restore
-        h._evict_slot.assert_called_with(0)
+        # Ancestor match — accepted regardless of token count comparison
+        result = h._pick_slot_for_restore(node, 2000)
+        self.assertEqual(result, (0, False))  # no restore needed
+        h._evict_slot.assert_not_called()
 
-    def test_evicts_small_node_first(self):
-        """When all slots are full, prefer evicting a slot with < 10000 tok."""
+    def test_evicts_lru_slot(self):
+        """When all slots are full, evict the LRU slot (least recently written).
+        Token count is not the metric — LRU tells us which slot is least likely
+        to be actively in use."""
         state = SlotState()
-        state.record(0, "node-big", 50000)
+        state.record(0, "node-big", 50000)   # LRU — recorded first
         state.record(1, "node-small", 8000)
-        state.record(2, "node-medium", 30000)
+        state.record(2, "node-medium", 30000)  # MRU — recorded last
         h = make_handler(state=state, discover_slots=[
             {"id": 0, "is_busy": True},
             {"id": 1, "is_busy": True},
@@ -128,8 +131,8 @@ class TestPickSlotForRestore(unittest.TestCase):
 
         node = {"id": "node-new", "token_count": 1000}
         result = h._pick_slot_for_restore(node, 500)
-        self.assertEqual(result, (1, True))  # evict the small one, needs restore
-        h._evict_slot.assert_called_with(1)
+        self.assertEqual(result, (0, True))  # evict LRU slot 0, needs restore
+        h._evict_slot.assert_called_with(0)
 
     def test_evicts_lru_when_no_small_node(self):
         """When all slots have >= 10000 tok, evict LRU."""
@@ -233,7 +236,8 @@ class TestPickSlotForRestore(unittest.TestCase):
         self.assertEqual(result, (0, False))
 
     def test_shallow_ancestor_request_shorter_than_slot(self):
-        """When request is shorter than slot's loaded prefix, don't reuse."""
+        """Ancestor match is accepted unconditionally — even when request is
+        shorter than the shared prefix, llama.cpp computes the delta."""
         state = SlotState()
         state.record(0, "node-root", 100)
         nodes = {
@@ -243,10 +247,29 @@ class TestPickSlotForRestore(unittest.TestCase):
         h = make_handler(state=state, discover_slots=[{"id": 0, "is_busy": True}], mock_evict=True, nodes=nodes)
         node = {"id": "node-A", "parent_id": "node-root", "token_count": 5000}
 
-        # shared prefix is 100 tok, request (50) < 100 → don't reuse, falls to eviction
+        # Ancestor match — accepted regardless of token count comparison
         result = h._pick_slot_for_restore(node, 50)
-        self.assertEqual(result, (0, True))  # eviction returns slot 0, needs restore
-        h._evict_slot.assert_called_with(0)
+        self.assertEqual(result, (0, False))  # no restore needed
+        h._evict_slot.assert_not_called()
+
+    def test_descendant_match_accepted(self):
+        """When slot holds a descendant of the matched node (autosave lag),
+        accept it — llama.cpp can use its existing prefix."""
+        state = SlotState()
+        # Slot has a large node (111k) that's a descendant of the anchor
+        state.record(0, "node-large", 111000)
+        nodes = {
+            "anchor-node": {"id": "anchor-node", "parent_id": None, "token_count": 5344},
+            "node-medium": {"id": "node-medium", "parent_id": "anchor-node", "token_count": 50000},
+            "node-large": {"id": "node-large", "parent_id": "node-medium", "token_count": 111000},
+        }
+        h = make_handler(state=state, discover_slots=[{"id": 0, "is_busy": True}], mock_evict=True, nodes=nodes)
+        # Matched node is the anchor (5344 tokens), slot has descendant (111k)
+        node = {"id": "anchor-node", "parent_id": None, "token_count": 5344}
+
+        result = h._pick_slot_for_restore(node, 6000)
+        self.assertEqual(result, (0, False))  # descendant match, no restore needed
+        h._evict_slot.assert_not_called()
 
     def test_idle_slot_used_before_eviction(self):
         """Idle slots are preferred over eviction."""
